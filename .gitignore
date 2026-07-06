@@ -1,0 +1,50 @@
+# Local data and generated outputs
+video/
+outputs/
+debug/
+tmp/
+temp/
+
+# Model/checkpoint/data artifacts
+third_party/
+_DATA/
+*.ckpt
+*.pth
+*.pt
+*.onnx
+*.npy
+*.npz
+*.pkl
+
+# Media and reconstructed assets
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+*.mp4
+*.MP4
+*.mov
+*.avi
+*.gif
+*.obj
+*.ply
+
+# Python/runtime cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local tooling state
+.agents/
+.codex/
+.venv/
+venv/
+
+# OS/editor noise
+.DS_Store
+*.swp
+*.swo
