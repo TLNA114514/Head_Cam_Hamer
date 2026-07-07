@@ -41,13 +41,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sam3-conda-env", default="sam3hand")
     parser.add_argument("--hamer-conda-env", default="hamer")
     parser.add_argument("--sam3-root", type=Path, default=WRIST_CAM_ROOT / "third_party" / "sam3")
+    parser.add_argument("--sam3-checkpoint", type=Path, help="Optional local SAM3 checkpoint. Prevents HuggingFace download when provided.")
+    parser.add_argument("--sam3-no-hf", action="store_true", help="Do not allow SAM3 to download checkpoints from HuggingFace.")
+    parser.add_argument("--sam3-hf-endpoint", default="https://hf-mirror.com", help="HF endpoint used by SAM3 downloads.")
+    parser.add_argument("--sam3-version", choices=["sam3", "sam3.1"], default="sam3.1", help="SAM3 native video tracker version.")
     parser.add_argument("--hamer-root", type=Path, default=WRIST_CAM_ROOT / "third_party" / "hamer")
     parser.add_argument("--prompt-preset", choices=["bare", "gloved", "custom"], default="bare")
     parser.add_argument("--prompt", action="append", dest="prompts")
     parser.add_argument(
+        "--hand-track-backend",
+        choices=["image", "posthoc", "sam3-native"],
+        default="posthoc",
+        help="Hand identity backend: image keeps old framewise SAM3; posthoc links boxes; sam3-native uses SAM3 video tracking.",
+    )
+    parser.add_argument("--track-overlap", type=int, default=10)
+    parser.add_argument("--handedness-lock-score", type=float, default=0.85)
+    parser.add_argument("--lock-votes", type=int, default=3)
+    parser.add_argument("--unlock-votes", type=int, default=5)
+    parser.add_argument("--max-missing", type=int, default=8)
+    parser.add_argument(
         "--camera-handedness-override",
+        default="none",
+        help='Fusion-stage hard handedness overrides; use "none" to disable.',
+    )
+    parser.add_argument(
+        "--camera-handedness-prior",
         default="C0:Left,C3:Right",
-        help='Fusion-stage camera handedness overrides, e.g. "C0:Left,C3:Right"; use "none" to disable.',
+        help='Weak camera handedness priors used only for unknown labels; use "none" to disable.',
     )
     parser.add_argument("--temporal", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--temporal-selection-weight", type=float, default=0.45)
@@ -73,6 +93,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backup-min-view-quality", type=float, default=0.45)
     parser.add_argument("--backup-max-temporal-error-m", type=float, default=0.06)
     parser.add_argument("--backup-require-known", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--run-mano-local-refine", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--optimize-mano-pose", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--optimize-mano-betas", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--allow-frame-beta-delta", action="store_true")
+    parser.add_argument("--local-consistency-threshold-m", type=float, default=0.025)
+    parser.add_argument("--temporal-reject-threshold-m", type=float, default=0.12)
+    parser.add_argument("--pose-prior-weight", type=float, default=0.25)
+    parser.add_argument("--beta-prior-weight", type=float, default=1.0)
+    parser.add_argument("--temporal-pose-weight", type=float, default=0.35)
+    parser.add_argument("--vertex-loss-weight", type=float, default=0.10)
+    parser.add_argument("--mano-max-iters", type=int, default=80)
+    parser.add_argument("--mano-beta-iters", type=int, default=120)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-mediapipe", action="store_true")
@@ -263,6 +295,26 @@ def merge_jsonl(inputs: list[Path], output: Path, record_type: str | None = None
     return count
 
 
+def merge_jsonl_unique(inputs: list[Path], output: Path, record_type: str | None, key_fields: tuple[str, ...]) -> int:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    seen = set()
+    count = 0
+    with output.open("w", encoding="utf-8") as out:
+        for path in inputs:
+            if not path.exists():
+                continue
+            for record in iter_jsonl(path):
+                if record_type and record.get("type") != record_type:
+                    continue
+                key = tuple(record.get(field) for field in key_fields)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+                count += 1
+    return count
+
+
 def conda_python(conda_bin: str, env_name: str) -> list[str]:
     return [conda_bin, "run", "--no-capture-output", "-n", env_name, "python", "-u", "-s"]
 
@@ -293,6 +345,15 @@ def chunk_suffix_and_args(ids: list[int]) -> tuple[str, list[str]]:
     return suffix, ["--group-ids", ",".join(str(item) for item in ids)]
 
 
+def expanded_chunk_ids(chunk_ids: list[int], selected_group_ids: list[int], overlap: int) -> list[int]:
+    if overlap <= 0:
+        return list(chunk_ids)
+    selected = set(selected_group_ids)
+    start = chunk_ids[0] - overlap
+    end = chunk_ids[-1] + overlap
+    return [group_id for group_id in selected_group_ids if group_id in selected and start <= group_id <= end]
+
+
 def main() -> None:
     args = parse_args()
     cameras = sorted(parse_cameras(args.cameras))
@@ -310,6 +371,8 @@ def main() -> None:
         raise SystemExit(f"SAM3 root not found: {args.sam3_root}. Reuse/setup wrist_cam first.")
     if not args.hamer_root.exists():
         raise SystemExit(f"HaMeR root not found: {args.hamer_root}. Reuse/setup wrist_cam first.")
+    if args.sam3_no_hf and args.sam3_checkpoint is None and not args.skip_sam3:
+        raise SystemExit("--sam3-no-hf requires --sam3-checkpoint, otherwise SAM3 has no checkpoint to load.")
 
     common_range = []
     if args.group_range:
@@ -376,17 +439,28 @@ def main() -> None:
             emit(f"[pipeline] skip MediaPipe, found {mediapipe_path}")
 
     sam3_output = args.base_dir / "sam3_bboxes" / f"sam3_bboxes_{suffix}.jsonl"
+    stabilized_tracks_output = args.base_dir / "sam3_tracks_stabilized" / f"sam3_tracks_stabilized_{suffix}.jsonl"
     jobs_path = args.base_dir / "hamer_jobs" / f"hamer_jobs_{suffix}.jsonl"
     hamer_output = args.base_dir / "hamer_per_view" / f"hamer_predictions_{suffix}.jsonl"
     sam3_shards = []
+    stabilized_track_shards = []
     job_shards = []
     hamer_shards = []
 
     def heavy_chunk_pipeline(camera_id: str, chunk_ids: list[int], progress_position: int) -> None:
         chunk_suffix, chunk_range = chunk_suffix_and_args(chunk_ids)
+        track_ids = expanded_chunk_ids(chunk_ids, selected_group_ids, args.track_overlap if args.hand_track_backend == "sam3-native" else 0)
+        track_suffix, track_range = chunk_suffix_and_args(track_ids)
         label_suffix = f"{camera_id}:{chunk_suffix}"
-        sam3_dir = args.base_dir / "sam3_bboxes" / "chunks" / camera_id / chunk_suffix
-        sam3_shard = sam3_dir / f"sam3_bboxes_{chunk_suffix}.jsonl"
+        sam3_detect_suffix = track_suffix if args.hand_track_backend == "sam3-native" else chunk_suffix
+        sam3_detect_range = track_range if args.hand_track_backend == "sam3-native" else chunk_range
+        sam3_dir = args.base_dir / "sam3_bboxes" / "chunks" / camera_id / sam3_detect_suffix
+        sam3_shard = sam3_dir / f"sam3_bboxes_{sam3_detect_suffix}.jsonl"
+        sequence_dir = args.base_dir / "sam3_video_sequences"
+        track_dir = args.base_dir / "sam3_tracks" / "chunks" / camera_id / track_suffix
+        track_shard = track_dir / f"sam3_tracks_{track_suffix}.jsonl"
+        stabilized_dir = args.base_dir / "sam3_tracks_stabilized" / "chunks" / camera_id / track_suffix
+        stabilized_shard = stabilized_dir / f"sam3_tracks_stabilized_{track_suffix}.jsonl"
         jobs_dir = args.base_dir / "hamer_jobs" / "chunks" / camera_id / chunk_suffix
         jobs_shard = jobs_dir / f"hamer_jobs_{chunk_suffix}.jsonl"
 
@@ -402,16 +476,96 @@ def main() -> None:
                 str(sam3_dir),
                 "--sam3-root",
                 str(args.sam3_root),
+                "--hf-endpoint",
+                args.sam3_hf_endpoint,
                 "--cameras",
                 camera_id,
                 "--prompt-preset",
                 args.prompt_preset,
-                *chunk_range,
+                *sam3_detect_range,
                 *overwrite,
             ]
+            if args.sam3_checkpoint:
+                sam3_cmd.extend(["--checkpoint", str(args.sam3_checkpoint)])
+            if args.sam3_no_hf:
+                sam3_cmd.append("--no-hf")
             for prompt in args.prompts or []:
                 sam3_cmd.extend(["--prompt", prompt])
             run_command(f"sam3:{label_suffix}", sam3_cmd, False, progress_position)
+
+        tracked_hands_args: list[str] = []
+        if args.hand_track_backend in {"posthoc", "sam3-native"}:
+            if args.hand_track_backend == "sam3-native":
+                sequence_cmd = [
+                    sys.executable,
+                    "-u",
+                    script_path("prepare_sam3_video_sequences.py"),
+                    "--frames",
+                    str(args.frames),
+                    "--rectified-dir",
+                    str(args.base_dir / "rectified_for_hamer"),
+                    "--output-dir",
+                    str(sequence_dir),
+                    "--cameras",
+                    camera_id,
+                    *track_range,
+                    *overwrite,
+                ]
+                run_command(f"sequence:{label_suffix}", sequence_cmd, False, progress_position)
+                track_cmd = [
+                    *conda_python(args.conda_bin, args.sam3_conda_env),
+                    script_path("track_sam3_hands_video.py"),
+                    "--sequence-dir",
+                    str(sequence_dir),
+                    "--seed-sam3",
+                    str(sam3_shard),
+                    "--output-dir",
+                    str(track_dir),
+                    "--sam3-root",
+                    str(args.sam3_root),
+                    "--hf-endpoint",
+                    args.sam3_hf_endpoint,
+                    "--version",
+                    args.sam3_version,
+                    "--cameras",
+                    camera_id,
+                    *track_range,
+                    *overwrite,
+                ]
+                if args.sam3_checkpoint:
+                    track_cmd.extend(["--checkpoint", str(args.sam3_checkpoint)])
+                if args.sam3_no_hf:
+                    track_cmd.append("--no-hf")
+                run_command(f"sam3_track:{label_suffix}", track_cmd, False, progress_position)
+                tracks_for_stabilizer = track_shard
+            else:
+                tracks_for_stabilizer = sam3_shard
+
+            stabilize_cmd = [
+                sys.executable,
+                "-u",
+                script_path("stabilize_hand_identity_tracks.py"),
+                "--tracks",
+                str(tracks_for_stabilizer),
+                "--mediapipe",
+                str(mediapipe_path),
+                "--output-dir",
+                str(stabilized_dir),
+                "--cameras",
+                camera_id,
+                "--mediapipe-strong-score",
+                str(args.handedness_lock_score),
+                "--lock-votes",
+                str(args.lock_votes),
+                "--unlock-votes",
+                str(args.unlock_votes),
+                "--max-missing",
+                str(args.max_missing),
+                *track_range,
+                *overwrite,
+            ]
+            run_command(f"stabilize:{label_suffix}", stabilize_cmd, False, progress_position)
+            tracked_hands_args = ["--tracked-hands", str(stabilized_shard)]
 
         fusion_cmd = [
             sys.executable,
@@ -431,6 +585,9 @@ def main() -> None:
             camera_id,
             "--camera-handedness-override",
             args.camera_handedness_override,
+            "--camera-handedness-prior",
+            args.camera_handedness_prior,
+            *tracked_hands_args,
             *chunk_range,
             *overwrite,
         ]
@@ -457,14 +614,20 @@ def main() -> None:
     for chunk_ids in chunks:
         for camera_id in cameras:
             chunk_suffix, _chunk_range = chunk_suffix_and_args(chunk_ids)
-            sam3_shards.append(args.base_dir / "sam3_bboxes" / "chunks" / camera_id / chunk_suffix / f"sam3_bboxes_{chunk_suffix}.jsonl")
+            sam3_detect_ids = expanded_chunk_ids(chunk_ids, selected_group_ids, args.track_overlap if args.hand_track_backend == "sam3-native" else 0)
+            sam3_detect_suffix, _sam3_detect_range = chunk_suffix_and_args(sam3_detect_ids)
+            sam3_shards.append(args.base_dir / "sam3_bboxes" / "chunks" / camera_id / sam3_detect_suffix / f"sam3_bboxes_{sam3_detect_suffix}.jsonl")
+            if args.hand_track_backend in {"posthoc", "sam3-native"}:
+                track_ids = expanded_chunk_ids(chunk_ids, selected_group_ids, args.track_overlap if args.hand_track_backend == "sam3-native" else 0)
+                track_suffix, _track_range = chunk_suffix_and_args(track_ids)
+                stabilized_track_shards.append(args.base_dir / "sam3_tracks_stabilized" / "chunks" / camera_id / track_suffix / f"sam3_tracks_stabilized_{track_suffix}.jsonl")
             job_shards.append(args.base_dir / "hamer_jobs" / "chunks" / camera_id / chunk_suffix / f"hamer_jobs_{chunk_suffix}.jsonl")
             hamer_shards.append(args.base_dir / "hamer_per_view" / f"hamer_predictions_{chunk_suffix}_{camera_id}.jsonl")
             heavy_tasks.append((f"heavy:{camera_id}:{chunk_suffix}", camera_id, chunk_ids))
 
     if args.dry_run:
         for label, camera_id, chunk_ids in heavy_tasks:
-            emit(f"[pipeline] parallel {label}: SAM3 -> fuse jobs -> HaMeR for {camera_id} groups={chunk_ids[0]}-{chunk_ids[-1]}")
+            emit(f"[pipeline] parallel {label}: SAM3 -> {args.hand_track_backend} identity -> fuse jobs -> HaMeR for {camera_id} groups={chunk_ids[0]}-{chunk_ids[-1]}")
     else:
         positions: Queue[int] = Queue()
         for position in range(1, max_workers + 1):
@@ -490,12 +653,17 @@ def main() -> None:
 
     if args.dry_run:
         emit(f"[pipeline] merge SAM3 shards -> {sam3_output}")
+        if args.hand_track_backend in {"posthoc", "sam3-native"}:
+            emit(f"[pipeline] merge stabilized tracks -> {stabilized_tracks_output}")
         emit(f"[pipeline] merge HaMeR job shards -> {jobs_path}")
         emit(f"[pipeline] merge HaMeR shards -> {hamer_output}")
     else:
-        sam3_count = merge_jsonl(sam3_shards, sam3_output, "sam3_multiview_bboxes")
+        sam3_count = merge_jsonl_unique(sam3_shards, sam3_output, "sam3_multiview_bboxes", ("type", "group_id", "camera_id"))
         job_count = merge_jsonl(job_shards, jobs_path, "hamer_multiview_jobs")
         emit(f"[pipeline] merged SAM3 records: {sam3_count} -> {sam3_output}")
+        if args.hand_track_backend in {"posthoc", "sam3-native"}:
+            track_count = merge_jsonl_unique(stabilized_track_shards, stabilized_tracks_output, "sam3_stabilized_tracks", ("type", "group_id", "camera_id"))
+            emit(f"[pipeline] merged stabilized tracks: {track_count} -> {stabilized_tracks_output}")
         emit(f"[pipeline] merged HaMeR jobs: {job_count} -> {jobs_path}")
         if not args.skip_hamer:
             hamer_count = merge_jsonl(hamer_shards, hamer_output, "hamer_multiview_prediction")
@@ -559,6 +727,48 @@ def main() -> None:
         *overwrite,
     ]
     run_command("local_fusion", local_cmd, args.dry_run)
+
+    if args.run_mano_local_refine and not args.skip_hamer:
+        local_hands_path = args.base_dir / "hamer_primary_local" / f"hamer_local_hands_{suffix}.jsonl"
+        mano_refine_cmd = [
+            *conda_python(args.conda_bin, args.hamer_conda_env),
+            script_path("refine_hamer_mano_local.py"),
+            "--predictions",
+            str(hamer_output),
+            "--local-hands",
+            str(local_hands_path),
+            "--output-dir",
+            str(args.base_dir / "hamer_mano_local_refined"),
+            "--hamer-root",
+            str(args.hamer_root),
+            "--optimize-mano-pose" if args.optimize_mano_pose else "--no-optimize-mano-pose",
+            "--optimize-mano-betas" if args.optimize_mano_betas else "--no-optimize-mano-betas",
+            "--local-consistency-threshold-m",
+            str(args.local_consistency_threshold_m),
+            "--temporal-error-cap-m",
+            str(args.temporal_error_cap_m),
+            "--temporal-reject-threshold-m",
+            str(args.temporal_reject_threshold_m),
+            "--anchor-switch-margin",
+            str(args.anchor_switch_margin),
+            "--pose-prior-weight",
+            str(args.pose_prior_weight),
+            "--beta-prior-weight",
+            str(args.beta_prior_weight),
+            "--temporal-pose-weight",
+            str(args.temporal_pose_weight),
+            "--vertex-loss-weight",
+            str(args.vertex_loss_weight),
+            "--max-iters",
+            str(args.mano_max_iters),
+            "--beta-iters",
+            str(args.mano_beta_iters),
+            *common_range,
+            *overwrite,
+        ]
+        if args.allow_frame_beta_delta:
+            mano_refine_cmd.append("--allow-frame-beta-delta")
+        run_command("mano_local_refine", mano_refine_cmd, args.dry_run)
 
 
 if __name__ == "__main__":

@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rectified-dir", type=Path, default=DEFAULT_BASE_DIR / "rectified_for_hamer")
     parser.add_argument("--mediapipe", type=Path, default=DEFAULT_BASE_DIR / "landmarks.jsonl")
     parser.add_argument("--sam3", type=Path, help="SAM3 JSONL. Defaults to output-dir sibling sam3_bboxes by range.")
+    parser.add_argument("--tracked-hands", type=Path, help="Stabilized SAM3 tracks JSONL. Overrides --sam3 when provided.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_BASE_DIR / "hamer_jobs")
     parser.add_argument("--cameras", default=",".join(DEFAULT_CAMERAS))
     parser.add_argument("--group-range")
@@ -55,8 +56,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-feather", type=int, default=11)
     parser.add_argument(
         "--camera-handedness-override",
-        default="C0:Left,C3:Right",
+        default="none",
         help='Comma-separated camera handedness overrides, e.g. "C0:Left,C3:Right"; use "none" to disable.',
+    )
+    parser.add_argument(
+        "--camera-handedness-prior",
+        default="C0:Left,C3:Right",
+        help='Weak camera handedness prior used only for unknown labels, e.g. "C0:Left,C3:Right"; use "none" to disable.',
     )
     parser.add_argument("--progress-position", type=int, default=int(os.environ.get("TQDM_POSITION", "0")))
     parser.add_argument("--overwrite", action="store_true")
@@ -148,8 +154,36 @@ def load_sam3(path: Path, cameras: set[str], group_ids: set[int] | None) -> dict
                 continue
             item = dict(hand)
             item["bbox"] = [float(v) for v in bbox]
+            if item.get("locked_handedness") in {"Left", "Right"}:
+                item["handedness"] = item["locked_handedness"]
             data[(group_id, camera_id)].append(item)
     return data
+
+
+def best_handedness_from_sam3(sam: dict[str, Any] | None) -> tuple[str | None, str | None, float | None]:
+    if not sam:
+        return None, None, None
+    locked = sam.get("locked_handedness")
+    if locked in {"Left", "Right"}:
+        return locked, sam.get("handedness_source") or "sam3_track_locked", sam.get("handedness_confidence")
+    handedness = sam.get("handedness")
+    if handedness in {"Left", "Right"}:
+        return handedness, sam.get("handedness_source") or "sam3", sam.get("handedness_confidence")
+    return None, None, None
+
+
+def apply_camera_prior(job: dict[str, Any], camera_id: str, priors: dict[str, str]) -> None:
+    prior = priors.get(camera_id)
+    if not prior:
+        return
+    if job.get("handedness") in {"Left", "Right"} and not str(job.get("handedness_source", "")).startswith("sam3_only_unknown"):
+        return
+    job["original_handedness"] = job.get("handedness")
+    job["original_handedness_source"] = job.get("handedness_source")
+    job["handedness"] = prior
+    job["handedness_source"] = f"camera_prior:{camera_id}"
+    job["is_right"] = handedness_to_is_right(prior)
+    job["camera_handedness_prior"] = True
 
 
 def create_blur_frame(
@@ -204,6 +238,7 @@ def fuse_one(
     sam_hands: list[dict[str, Any]],
     args: argparse.Namespace,
     handedness_overrides: dict[str, str],
+    handedness_priors: dict[str, str],
 ) -> list[dict[str, Any]]:
     jobs = []
     used_sam = set()
@@ -224,11 +259,16 @@ def fuse_one(
             source = "mediapipe+sam3"
             mask_path = sam.get("mask_path")
             sam_score = sam.get("score")
+            sam_handedness, sam_handedness_source, sam_handedness_score = best_handedness_from_sam3(sam)
         else:
             bbox = expand_bbox(mp["bbox"], args.bbox_pad)
             source = "mediapipe"
             mask_path = None
             sam_score = None
+            sam_handedness, sam_handedness_source, sam_handedness_score = None, None, None
+        handedness = sam_handedness or mp["handedness"]
+        handedness_source = sam_handedness_source or mp.get("source", "mediapipe")
+        handedness_score = sam_handedness_score if sam_handedness is not None else mp["handedness_score"]
         hamer_frame, used_blur = create_blur_frame(
             image_path,
             mask_path,
@@ -244,13 +284,16 @@ def fuse_one(
                 "hamer_frame_path": hamer_frame,
                 "used_mask_blur": used_blur,
                 "bbox_rectified_px": bbox,
-                "handedness": mp["handedness"],
-                "handedness_source": mp.get("source", "mediapipe"),
-                "handedness_score": mp["handedness_score"],
-                "is_right": handedness_to_is_right(mp["handedness"]),
+                "handedness": handedness,
+                "handedness_source": handedness_source,
+                "handedness_score": handedness_score,
+                "is_right": handedness_to_is_right(handedness),
                 "source_detector": source,
                 "sam3_mask_path": mask_path,
                 "sam3_score": sam_score,
+                "track_id": sam.get("track_id") if sam else None,
+                "locked_handedness": sam.get("locked_handedness") if sam else None,
+                "handedness_confidence": sam.get("handedness_confidence") if sam else None,
                 "debug_only": False,
                 "original_handedness": mp.get("original_handedness"),
             }
@@ -267,7 +310,12 @@ def fuse_one(
     for _sam_index, sam in leftover:
         if len([job for job in jobs if not job.get("debug_only")]) >= args.max_hands:
             break
-        if len(mp_sides) == 1:
+        sam_handedness, sam_handedness_source, sam_handedness_score = best_handedness_from_sam3(sam)
+        if sam_handedness in {"Left", "Right"}:
+            handedness = sam_handedness
+            handedness_source = sam_handedness_source or "sam3_track_locked"
+            debug_only = False
+        elif len(mp_sides) == 1:
             handedness = opposite_handedness(next(iter(mp_sides)))
             handedness_source = "sam3_opposite_of_single_mediapipe"
             debug_only = False
@@ -298,15 +346,20 @@ def fuse_one(
                 "bbox_rectified_px": bbox,
                 "handedness": handedness,
                 "handedness_source": handedness_source,
-                "handedness_score": None,
+                "handedness_score": sam_handedness_score,
                 "is_right": handedness_to_is_right(handedness),
                 "source_detector": "sam3",
                 "sam3_mask_path": sam.get("mask_path"),
                 "sam3_score": sam.get("score"),
+                "track_id": sam.get("track_id"),
+                "locked_handedness": sam.get("locked_handedness"),
+                "handedness_confidence": sam.get("handedness_confidence"),
                 "debug_only": debug_only,
             }
         )
     jobs = jobs[: max(args.max_hands, len(mp_hands))]
+    for job in jobs:
+        apply_camera_prior(job, camera_id, handedness_priors)
     override_handedness = handedness_overrides.get(camera_id)
     if override_handedness:
         for job in jobs:
@@ -324,8 +377,9 @@ def main() -> None:
     cameras = parse_cameras(args.cameras)
     group_ids = parse_group_ids(args.group_range, args.group_ids)
     handedness_overrides = parse_camera_handedness_override(args.camera_handedness_override)
+    handedness_priors = parse_camera_handedness_override(args.camera_handedness_prior)
     suffix = range_suffix(group_ids)
-    sam3_path = args.sam3 or (DEFAULT_BASE_DIR / "sam3_bboxes" / f"sam3_bboxes_{suffix}.jsonl")
+    sam3_path = args.tracked_hands or args.sam3 or (DEFAULT_BASE_DIR / "sam3_bboxes" / f"sam3_bboxes_{suffix}.jsonl")
     output_path = args.output_dir / f"hamer_jobs_{suffix}.jsonl"
 
     records = filter_frame_records(args.frames, cameras, group_ids)
@@ -349,7 +403,7 @@ def main() -> None:
             camera_id = record["camera_id"]
             key = (group_id, camera_id)
             image_path = args.rectified_dir / rectified_rel_path(record)
-            jobs = fuse_one(group_id, camera_id, image_path, mp.get(key, []), sam3.get(key, []), args, handedness_overrides)
+            jobs = fuse_one(group_id, camera_id, image_path, mp.get(key, []), sam3.get(key, []), args, handedness_overrides, handedness_priors)
             draw_debug(
                 image_path,
                 mp.get(key, []),
@@ -367,6 +421,10 @@ def main() -> None:
                     stats["debug_only"] += 1
                 if job.get("camera_handedness_override"):
                     stats[f"camera_handedness_override:{camera_id}->{job['handedness']}"] += 1
+                if job.get("camera_handedness_prior"):
+                    stats[f"camera_handedness_prior:{camera_id}->{job['handedness']}"] += 1
+                if job.get("track_id"):
+                    stats["track_jobs"] += 1
             out.write(
                 json.dumps(
                     {
@@ -390,6 +448,7 @@ def main() -> None:
                 "group_range": args.group_range,
                 "group_ids": args.group_ids,
                 "camera_handedness_override": handedness_overrides,
+                "camera_handedness_prior": handedness_priors,
                 "stats": dict(stats),
             },
             f,

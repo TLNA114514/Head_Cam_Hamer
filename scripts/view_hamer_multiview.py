@@ -22,13 +22,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-root", type=Path, default=Path("video/cameras"))
     parser.add_argument("--calib", type=Path, default=Path("video/cameras/cameras.yaml"))
     parser.add_argument("--space", choices=["world", "root-relative", "palm-local"], default="palm-local")
-    parser.add_argument("--stride", type=int, default=1)
+    parser.add_argument("--stride", type=int, default=2)
     parser.add_argument("--max-frames", type=int)
     parser.add_argument("--interval-ms", type=int, default=40)
     parser.add_argument("--fixed-range", type=float, default=0.35)
     parser.add_argument("--image-downscale", type=int, default=2)
     parser.add_argument("--elev", type=float, default=20.0)
     parser.add_argument("--azim", type=float, default=-65.0)
+    parser.add_argument("--render-mode", choices=["skeleton", "mesh", "mesh+skeleton"], default="mesh+skeleton")
+    parser.add_argument("--mesh-stride", type=int, default=8)
     parser.add_argument("--no-mediapipe-overlay", action="store_true")
     parser.add_argument("--no-camera-rig", action="store_true")
     return parser.parse_args()
@@ -36,6 +38,9 @@ def parse_args() -> argparse.Namespace:
 
 def default_triangulated_path(base_dir: Path, group_range: str | None, group_ids: str | None) -> Path:
     suffix = range_suffix(parse_group_ids(group_range, group_ids))
+    refined = base_dir / "hamer_mano_local_refined" / f"mano_local_hands_{suffix}.jsonl"
+    if refined.exists():
+        return refined
     ranged = base_dir / "hamer_primary_local" / f"hamer_local_hands_{suffix}.jsonl"
     if ranged.exists():
         return ranged
@@ -75,6 +80,10 @@ def main() -> None:
         str(args.elev),
         "--azim",
         str(args.azim),
+        "--render-mode",
+        args.render_mode,
+        "--mesh-stride",
+        str(args.mesh_stride),
     ]
     if args.group_range:
         command.extend(["--group-range", args.group_range])

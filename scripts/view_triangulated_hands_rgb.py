@@ -95,6 +95,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-downscale", type=int, default=2, help="Integer RGB display downscale.")
     parser.add_argument("--elev", type=float, default=20, help="Initial 3D elevation.")
     parser.add_argument("--azim", type=float, default=-65, help="Initial 3D azimuth.")
+    parser.add_argument("--render-mode", choices=["skeleton", "mesh", "mesh+skeleton"], default="skeleton", help="3D hand rendering mode for MANO outputs.")
+    parser.add_argument("--mesh-stride", type=int, default=8, help="Subsample MANO vertices by this stride in the viewer.")
     return parser.parse_args()
 
 
@@ -174,6 +176,14 @@ def normalize_hamer_local_frame(record: dict[str, Any]) -> dict[str, Any]:
                 continue
             offset = -0.09 if hand.get("handedness") == "Left" else 0.09
             display_position = [float(position[0]) + offset, float(position[1]), float(position[2])]
+            palm_position = None
+            palm_values = hand.get("palm_local_joints_m") or []
+            if index < len(palm_values) and is_xyz(palm_values[index]):
+                palm_position = [
+                    float(palm_values[index][0]) + offset,
+                    float(palm_values[index][1]),
+                    float(palm_values[index][2]),
+                ]
             joints.append(
                 {
                     "index": index,
@@ -181,6 +191,8 @@ def normalize_hamer_local_frame(record: dict[str, Any]) -> dict[str, Any]:
                     "valid": True,
                     "metric_valid": bool(hand.get("metric_valid")),
                     "position": display_position,
+                    "root_relative_headset_m": display_position,
+                    "palm_local_m": palm_position or display_position,
                     "source_cameras": hand.get("used_cameras", []),
                     "rejected_cameras": hand.get("rejected_cameras", []),
                     "reconstruction_mode": hand.get("mode"),
@@ -201,13 +213,13 @@ def load_triangulated_frames(path: Path, stride: int, max_frames: int | None, gr
     frames = []
     for source_index, record in enumerate(iter_jsonl(path)):
         record_type = record.get("type")
-        if record_type not in {"triangulated_mediapipe_hand_frame", "hand_local_refined_frame", "hamer_primary_local_frame"}:
+        if record_type not in {"triangulated_mediapipe_hand_frame", "hand_local_refined_frame", "hamer_primary_local_frame", "hamer_mano_local_refined_frame"}:
             continue
         if group_ids is not None and int(record["group_id"]) not in group_ids:
             continue
         if source_index % stride != 0:
             continue
-        if record_type == "hamer_primary_local_frame":
+        if record_type in {"hamer_primary_local_frame", "hamer_mano_local_refined_frame"}:
             record = normalize_hamer_local_frame(record)
         frames.append(record)
         if max_frames is not None and len(frames) >= max_frames:
@@ -216,7 +228,7 @@ def load_triangulated_frames(path: Path, stride: int, max_frames: int | None, gr
 
 
 def is_refined_frame(frame: dict[str, Any]) -> bool:
-    return frame.get("type") in {"hand_local_refined_frame", "hamer_primary_local_frame"}
+    return frame.get("type") in {"hand_local_refined_frame", "hamer_primary_local_frame", "hamer_mano_local_refined_frame"}
 
 
 def joint_position_for_space(hand: dict[str, Any], joint: dict[str, Any], space: str, refined: bool) -> list[float] | None:
@@ -258,6 +270,20 @@ def frame_points(frame: dict[str, Any], space: str) -> list[list[float]]:
     return points
 
 
+def hand_vertices_for_space(hand: dict[str, Any], space: str, stride: int) -> list[list[float]]:
+    if space == "palm-local" and hand.get("palm_local_vertices_m"):
+        vertices = hand.get("palm_local_vertices_m") or []
+    else:
+        vertices = hand.get("local_vertices_m") or []
+    step = max(1, int(stride))
+    offset = -0.09 if hand.get("handedness") == "Left" else 0.09
+    out = []
+    for vertex in vertices[::step]:
+        if is_xyz(vertex):
+            out.append([float(vertex[0]) + offset, float(vertex[1]), float(vertex[2])])
+    return out
+
+
 def frame_source_camera_counts(frame: dict[str, Any]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for hand in frame.get("hands", []):
@@ -287,6 +313,26 @@ def frame_anchor_camera_labels(frame: dict[str, Any]) -> dict[str, list[str]]:
             continue
         labels.setdefault(str(camera_id), []).append(str(handedness)[:1])
     return labels
+
+
+def frame_anchor_pose_errors(frame: dict[str, Any]) -> dict[str, list[float]]:
+    values: dict[str, list[float]] = {}
+    for hand in frame.get("hands", []):
+        camera_id = hand.get("anchor_camera") or hand.get("primary_camera")
+        pose_error = hand.get("pose_error_m", hand.get("temporal_pose_error_m"))
+        if camera_id and isinstance(pose_error, (int, float)):
+            values.setdefault(str(camera_id), []).append(float(pose_error))
+    return values
+
+
+def frame_anchor_beta_sources(frame: dict[str, Any]) -> dict[str, list[str]]:
+    values: dict[str, list[str]] = {}
+    for hand in frame.get("hands", []):
+        camera_id = hand.get("anchor_camera") or hand.get("primary_camera")
+        beta_source = hand.get("beta_source")
+        if camera_id and beta_source:
+            values.setdefault(str(camera_id), []).append(str(beta_source).replace("optimized_", "opt_"))
+    return values
 
 
 def set_axes_centered(ax, points: list[list[float]], fixed_range: float) -> None:
@@ -514,14 +560,20 @@ class RgbSkeletonViewer:
         used_camera_counts = frame_source_camera_counts(frame)
         rejected_camera_counts = frame_rejected_camera_counts(frame)
         anchor_labels = frame_anchor_camera_labels(frame)
+        pose_errors = frame_anchor_pose_errors(frame)
+        beta_sources = frame_anchor_beta_sources(frame)
 
         for camera_id, artist in self.image_artists.items():
             rgb, hand_count = self.read_rgb(group_id, camera_id)
             artist.set_data(rgb)
             anchor_text = "".join(anchor_labels.get(camera_id, [])) or "-"
+            err_values = pose_errors.get(camera_id, [])
+            err_text = f"{np.mean(err_values):.3f}" if err_values else "-"
+            beta_text = ",".join(sorted(set(beta_sources.get(camera_id, [])))) or "-"
             self.image_axes[camera_id].set_title(
                 f"{camera_id}  group {group_id}  MP hands={hand_count}  "
-                f"anchor={anchor_text}  used={used_camera_counts.get(camera_id, 0)}  rej={rejected_camera_counts.get(camera_id, 0)}",
+                f"anchor={anchor_text}  used={used_camera_counts.get(camera_id, 0)}  rej={rejected_camera_counts.get(camera_id, 0)}  "
+                f"err={err_text} beta={beta_text}",
                 fontsize=11,
                 pad=4,
             )
@@ -543,6 +595,25 @@ class RgbSkeletonViewer:
             handedness = hand.get("handedness", "unknown")
             color = colors.get(handedness, "#9b51e0")
             points = valid_hand_points(hand, self.args.space, refined)
+            if not points:
+                points = {}
+
+            if self.args.render_mode in {"mesh", "mesh+skeleton"}:
+                vertices = hand_vertices_for_space(hand, self.args.space, self.args.mesh_stride)
+                if vertices:
+                    scatter = self.ax3d.scatter(
+                        [p[0] for p in vertices],
+                        [p[1] for p in vertices],
+                        [p[2] for p in vertices],
+                        s=max(1.0, self.args.joint_size * 0.12),
+                        color=color,
+                        alpha=0.20,
+                        depthshade=True,
+                    )
+                    self.skeleton_artists.append(scatter)
+
+            if self.args.render_mode == "mesh":
+                continue
             if not points:
                 continue
 

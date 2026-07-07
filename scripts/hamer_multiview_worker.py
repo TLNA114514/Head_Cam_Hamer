@@ -189,6 +189,17 @@ def score_candidates_with_mask(
         candidate["mask_score"] = 0.45 * iou + 0.45 * sam_cov + 0.10 * mesh_cov
 
 
+def detach_mano_params(pred: dict[str, Any], index: int) -> dict[str, Any]:
+    params = pred.get("pred_mano_params") or {}
+    out = {}
+    for key in ("global_orient", "hand_pose", "betas"):
+        value = params.get(key)
+        if value is None:
+            continue
+        out[key] = value[index].detach().cpu().numpy().tolist()
+    return out
+
+
 def main() -> None:
     install_noise_filters()
     args = parse_args()
@@ -294,6 +305,7 @@ def main() -> None:
                             "raw_verts": pred["pred_vertices"][n].detach().cpu().numpy(),
                             "cam_t": pred_cam_t_full[n],
                             "pred_cam_t": pred["pred_cam_t"][n].detach().cpu().numpy(),
+                            "mano_params_rotmat": detach_mano_params(pred, n),
                             "batch_img": batch["img"][n].detach().cpu(),
                             "mask_score": None,
                         }
@@ -348,6 +360,8 @@ def main() -> None:
                 "hamer_vertices_cam": selected["verts"].tolist(),
                 "hamer_cam_t": selected["cam_t"].tolist(),
                 "hamer_pred_cam_t": selected["pred_cam_t"].tolist(),
+                "mano_params_rotmat": selected.get("mano_params_rotmat"),
+                "mano_param_source": "hamer" if selected.get("mano_params_rotmat") else None,
                 "bbox_scale": float(selected["bbox_scale"]),
                 "mask_score": selected.get("mask_score"),
                 "mask_iou": selected.get("mask_iou"),
