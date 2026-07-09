@@ -73,13 +73,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--detections",
         type=Path,
-        default=Path("video/mediapipe_hands_scale_0p30_handedness_fixed/landmarks.jsonl"),
+        default=Path("video/sam3_hamer_left_index/landmarks.jsonl"),
         help="Input MediaPipe multi-camera landmarks JSONL.",
     )
     parser.add_argument(
         "--calib",
         type=Path,
-        default=Path("video/cameras/cameras.yaml"),
+        default=Path("video/cameras_left_index/cameras.yaml"),
         help="Camera calibration YAML containing T_H_C.",
     )
     parser.add_argument(

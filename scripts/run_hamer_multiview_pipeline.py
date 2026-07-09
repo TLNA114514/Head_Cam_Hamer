@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mediapipe", type=Path, help="MediaPipe landmarks JSONL. Defaults to base-dir/landmarks.jsonl.")
     parser.add_argument("--rectify-focal-scale", type=float, default=0.30)
     parser.add_argument("--group-range")
+    parser.add_argument("--range", dest="range_alias", help="Short alias for --group-range.")
     parser.add_argument("--group-ids")
     parser.add_argument("--cameras", default=",".join(DEFAULT_CAMERAS))
     parser.add_argument("--chunk-size", type=int, default=50)
@@ -356,6 +357,8 @@ def expanded_chunk_ids(chunk_ids: list[int], selected_group_ids: list[int], over
 
 def main() -> None:
     args = parse_args()
+    if args.range_alias and not args.group_range:
+        args.group_range = args.range_alias
     cameras = sorted(parse_cameras(args.cameras))
     camera_set = set(cameras)
     group_ids = parse_group_ids(args.group_range, args.group_ids)

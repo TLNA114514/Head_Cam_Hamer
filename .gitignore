@@ -43,7 +43,7 @@ __pycache__/
 .codex/
 .venv/
 venv/
-
+gloves/
 # OS/editor noise
 .DS_Store
 *.swp

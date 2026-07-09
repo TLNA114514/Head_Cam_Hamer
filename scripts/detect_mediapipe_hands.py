@@ -54,10 +54,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run MediaPipe Hands on omnidir-rectified synchronized camera images."
     )
-    parser.add_argument("--input", default="video/cameras", type=Path, help="Camera image root.")
-    parser.add_argument("--calib", default="video/cameras/cameras.yaml", type=Path, help="Camera YAML.")
-    parser.add_argument("--frames", default="video/cameras/frames.jsonl", type=Path, help="Frame JSONL.")
-    parser.add_argument("--output", default="video/mediapipe_hands", type=Path, help="Output directory.")
+    parser.add_argument("--input", default="video/cameras_left_index", type=Path, help="Camera image root.")
+    parser.add_argument("--calib", default="video/cameras_left_index/cameras.yaml", type=Path, help="Camera YAML.")
+    parser.add_argument("--frames", default="video/cameras_left_index/frames.jsonl", type=Path, help="Frame JSONL.")
+    parser.add_argument("--output", default="video/mediapipe_left_index", type=Path, help="Output directory.")
     parser.add_argument("--cameras", default="C0,C1,C2,C3", help="Comma-separated camera ids.")
     parser.add_argument("--max-num-hands", default=2, type=int, help="Maximum hands per image.")
     parser.add_argument("--min-detection-confidence", default=0.5, type=float)

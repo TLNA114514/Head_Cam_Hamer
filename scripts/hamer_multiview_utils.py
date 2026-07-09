@@ -14,10 +14,10 @@ import numpy as np
 import yaml
 
 
-DEFAULT_BASE_DIR = Path("video/mediapipe_hands_scale_0p30_handedness_fixed")
-DEFAULT_IMAGE_ROOT = Path("video/cameras")
-DEFAULT_FRAMES = Path("video/cameras/frames.jsonl")
-DEFAULT_CALIB = Path("video/cameras/cameras.yaml")
+DEFAULT_BASE_DIR = Path("video/sam3_hamer_left_index")
+DEFAULT_IMAGE_ROOT = Path("video/cameras_left_index")
+DEFAULT_FRAMES = Path("video/cameras_left_index/frames.jsonl")
+DEFAULT_CALIB = Path("video/cameras_left_index/cameras.yaml")
 DEFAULT_CAMERAS = ("C0", "C1", "C2", "C3")
 IMAGE_SIZE = (1600, 1200)
 PRIMARY_CAMERAS = {"Left": "C1", "Right": "C2"}

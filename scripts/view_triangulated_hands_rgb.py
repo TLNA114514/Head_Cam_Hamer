@@ -61,13 +61,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--triangulated",
         type=Path,
-        default=Path("video/mediapipe_hands_scale_0p30_handedness_fixed/hand_local_refined/local_hands.jsonl"),
+        default=Path("video/sam3_hamer_left_index/hand_local_refined/local_hands.jsonl"),
         help="Triangulated or hand-local refined hand JSONL.",
     )
     parser.add_argument(
         "--frames",
         type=Path,
-        default=Path("video/cameras/frames.jsonl"),
+        default=Path("video/cameras_left_index/frames.jsonl"),
         help="Synchronized frame metadata JSONL.",
     )
     parser.add_argument(
@@ -75,8 +75,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="MediaPipe per-camera landmarks JSONL. Defaults to TRIANGULATED parent parent / landmarks.jsonl.",
     )
-    parser.add_argument("--image-root", type=Path, default=Path("video/cameras"), help="Image root.")
-    parser.add_argument("--calib", type=Path, default=Path("video/cameras/cameras.yaml"), help="Camera calibration YAML.")
+    parser.add_argument("--image-root", type=Path, default=Path("video/cameras_left_index"), help="Image root.")
+    parser.add_argument("--calib", type=Path, default=Path("video/cameras_left_index/cameras.yaml"), help="Camera calibration YAML.")
     parser.add_argument("--no-mediapipe-overlay", action="store_true", help="Show raw RGB images without MediaPipe 2D overlay.")
     parser.add_argument("--show-camera-rig", action=argparse.BooleanOptionalAction, default=True, help="Draw camera positions and forward directions in the 3D view.")
     parser.add_argument("--camera-axis-length", type=float, default=0.08, help="Camera direction marker length in meters.")
@@ -213,7 +213,7 @@ def load_triangulated_frames(path: Path, stride: int, max_frames: int | None, gr
     frames = []
     for source_index, record in enumerate(iter_jsonl(path)):
         record_type = record.get("type")
-        if record_type not in {"triangulated_mediapipe_hand_frame", "hand_local_refined_frame", "hamer_primary_local_frame", "hamer_mano_local_refined_frame"}:
+        if record_type not in {"triangulated_mediapipe_hand_frame", "hand_local_refined_frame", "hamer_primary_local_frame", "hamer_mano_local_refined_frame", "glove_local_frame"}:
             continue
         if group_ids is not None and int(record["group_id"]) not in group_ids:
             continue
@@ -228,7 +228,7 @@ def load_triangulated_frames(path: Path, stride: int, max_frames: int | None, gr
 
 
 def is_refined_frame(frame: dict[str, Any]) -> bool:
-    return frame.get("type") in {"hand_local_refined_frame", "hamer_primary_local_frame", "hamer_mano_local_refined_frame"}
+    return frame.get("type") in {"hand_local_refined_frame", "hamer_primary_local_frame", "hamer_mano_local_refined_frame", "glove_local_frame"}
 
 
 def joint_position_for_space(hand: dict[str, Any], joint: dict[str, Any], space: str, refined: bool) -> list[float] | None:
@@ -588,7 +588,7 @@ class RgbSkeletonViewer:
         refined = is_refined_frame(frame)
         all_points = frame_points(frame, self.args.space)
         set_axes_centered(self.ax3d, all_points, self.args.fixed_range)
-        title = "Hand-local refined skeleton" if refined else "Triangulated 3D skeleton"
+        title = "Glove palm-local skeleton" if frame.get("type") == "glove_local_frame" else ("Hand-local refined skeleton" if refined else "Triangulated 3D skeleton")
         self.ax3d.set_title(f"{title} ({self.args.space})", fontsize=12)
 
         for hand in frame.get("hands", []):
