@@ -28,12 +28,18 @@ FINGER_JOINTS = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hamer", type=Path, required=True, help="HaMeR local JSONL.")
+    parser.add_argument("--compare-hamer", action="append", type=Path, help="Additional HaMeR JSONL to evaluate against the same glove GT.")
     parser.add_argument("--glove", type=Path, required=True, help="Camera-synced glove local JSONL.")
-    parser.add_argument("--space", choices=["palm-local", "root-relative"], default="palm-local")
+    parser.add_argument(
+        "--space",
+        choices=["palm-local", "root-relative", "glove-calibrated-palm-local", "glove-calibrated-root-relative"],
+        default="palm-local",
+    )
     parser.add_argument("--hands", default="Left,Right")
     parser.add_argument("--fingers", default="thumb,index,middle")
     parser.add_argument("--group-range", help="Inclusive range, e.g. 1-100.")
     parser.add_argument("--group-ids", help="Comma-separated group ids.")
+    parser.add_argument("--group-parity", choices=["all", "even", "odd"], default="all")
     parser.add_argument("--output-json", type=Path)
     parser.add_argument("--output-csv", type=Path)
     parser.add_argument(
@@ -61,6 +67,15 @@ def parse_group_filter(group_range: str | None, group_ids: str | None) -> set[in
     return selected or None
 
 
+def apply_group_parity(group_filter: set[int] | None, parity: str) -> set[int] | None:
+    if parity == "all":
+        return group_filter
+    if group_filter is None:
+        raise SystemExit("--group-parity requires --group-range or --group-ids")
+    wanted = 0 if parity == "even" else 1
+    return {group_id for group_id in group_filter if group_id % 2 == wanted}
+
+
 def parse_fingers(value: str) -> list[str]:
     fingers = [item.strip() for item in value.split(",") if item.strip()]
     invalid = [finger for finger in fingers if finger not in FINGER_JOINTS]
@@ -78,18 +93,37 @@ def finite_xyz(value: Any) -> bool:
 
 
 def hand_positions(hand: dict[str, Any], space: str) -> np.ndarray | None:
-    direct_key = "palm_local_joints_m" if space == "palm-local" else "local_joints_m"
-    direct = hand.get(direct_key)
-    if isinstance(direct, list) and len(direct) >= 21 and all(finite_xyz(item) for item in direct[:21]):
-        return np.asarray(direct[:21], dtype=np.float64)
+    if space == "palm-local":
+        direct_keys = ["palm_local_joints_m"]
+        joint_keys = ["palm_local_m"]
+    elif space == "root-relative":
+        direct_keys = ["local_joints_m"]
+        joint_keys = ["root_relative_headset_m"]
+    elif space == "glove-calibrated-palm-local":
+        direct_keys = ["glove_calibrated_palm_local_joints_m", "palm_local_joints_m"]
+        joint_keys = ["glove_calibrated_palm_local_m", "palm_local_m"]
+    elif space == "glove-calibrated-root-relative":
+        direct_keys = ["glove_calibrated_root_relative_joints_m", "local_joints_m"]
+        joint_keys = ["glove_calibrated_root_relative_m", "root_relative_headset_m"]
+    else:
+        raise ValueError(f"Unsupported space: {space}")
 
-    joint_key = "palm_local_m" if space == "palm-local" else "root_relative_headset_m"
+    for direct_key in direct_keys:
+        direct = hand.get(direct_key)
+        if isinstance(direct, list) and len(direct) >= 21 and all(finite_xyz(item) for item in direct[:21]):
+            return np.asarray(direct[:21], dtype=np.float64)
+
     joints = hand.get("joints") or []
     out = np.full((21, 3), np.nan, dtype=np.float64)
     found = 0
     for joint in joints:
         index = joint.get("index", joint.get("joint_index"))
-        position = joint.get(joint_key)
+        position = None
+        for joint_key in joint_keys:
+            candidate = joint.get(joint_key)
+            if finite_xyz(candidate):
+                position = candidate
+                break
         if isinstance(index, int) and 0 <= index < 21 and finite_xyz(position):
             out[index] = np.asarray(position, dtype=np.float64)
             found += 1
@@ -197,15 +231,17 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def main() -> None:
-    args = parse_args()
-    group_filter = parse_group_filter(args.group_range, args.group_ids)
-    hands = parse_hands(args.hands)
-    fingers = parse_fingers(args.fingers)
-    target_joints = [(finger, index) for finger in fingers for index in FINGER_JOINTS[finger]]
-
-    hamer_frames = load_hands_by_group(args.hamer, args.space, group_filter)
-    glove_frames = load_hands_by_group(args.glove, args.space, group_filter)
+def evaluate_one(
+    hamer_path: Path,
+    glove_frames: dict[int, dict[str, dict[str, Any]]],
+    group_filter: set[int] | None,
+    space: str,
+    hands: list[str],
+    fingers: list[str],
+    target_joints: list[tuple[str, int]],
+    require_metric_valid: bool,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    hamer_frames = load_hands_by_group(hamer_path, space, group_filter)
     common_groups = sorted(set(hamer_frames) & set(glove_frames))
 
     rows: list[dict[str, Any]] = []
@@ -222,7 +258,7 @@ def main() -> None:
             if glove_hand is None:
                 missing_glove += 1
                 continue
-            if args.require_hamer_metric_valid and not hamer_hand.get("metric_valid"):
+            if require_metric_valid and not hamer_hand.get("metric_valid"):
                 skipped_nonmetric += 1
                 continue
             hamer_positions = hamer_hand["_positions"]
@@ -254,9 +290,8 @@ def main() -> None:
                 )
 
     summary = {
-        "hamer": str(args.hamer),
-        "glove": str(args.glove),
-        "space": args.space,
+        "hamer": str(hamer_path),
+        "space": space,
         "hands": hands,
         "fingers": fingers,
         "joint_indices": {finger: FINGER_JOINTS[finger] for finger in fingers},
@@ -267,6 +302,44 @@ def main() -> None:
         "skipped_nonmetric_hamer_hands": skipped_nonmetric,
         "stats": summarize(rows),
     }
+    return summary, rows
+
+
+def main() -> None:
+    args = parse_args()
+    group_filter = apply_group_parity(parse_group_filter(args.group_range, args.group_ids), args.group_parity)
+    hands = parse_hands(args.hands)
+    fingers = parse_fingers(args.fingers)
+    target_joints = [(finger, index) for finger in fingers for index in FINGER_JOINTS[finger]]
+
+    glove_frames = load_hands_by_group(args.glove, args.space, group_filter)
+    summary, rows = evaluate_one(
+        args.hamer,
+        glove_frames,
+        group_filter,
+        args.space,
+        hands,
+        fingers,
+        target_joints,
+        args.require_hamer_metric_valid,
+    )
+    summary["glove"] = str(args.glove)
+    summary["group_parity"] = args.group_parity
+    comparisons = []
+    for compare_path in args.compare_hamer or []:
+        compare_summary, _compare_rows = evaluate_one(
+            compare_path,
+            glove_frames,
+            group_filter,
+            args.space,
+            hands,
+            fingers,
+            target_joints,
+            args.require_hamer_metric_valid,
+        )
+        comparisons.append(compare_summary)
+    if comparisons:
+        summary["comparisons"] = comparisons
 
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
     if args.output_json:

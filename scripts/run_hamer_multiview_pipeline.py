@@ -47,6 +47,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sam3-hf-endpoint", default="https://hf-mirror.com", help="HF endpoint used by SAM3 downloads.")
     parser.add_argument("--sam3-version", choices=["sam3", "sam3.1"], default="sam3.1", help="SAM3 native video tracker version.")
     parser.add_argument("--hamer-root", type=Path, default=WRIST_CAM_ROOT / "third_party" / "hamer")
+    parser.add_argument(
+        "--save-hamer-rendered-overlays",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Save every HaMeR rendered overlay. Disabled by default to avoid full-sequence I/O; use selected debug/viewer outputs instead.",
+    )
     parser.add_argument("--prompt-preset", choices=["bare", "gloved", "custom"], default="bare")
     parser.add_argument("--prompt", action="append", dest="prompts")
     parser.add_argument(
@@ -95,6 +101,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backup-max-temporal-error-m", type=float, default=0.06)
     parser.add_argument("--backup-require-known", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--run-mano-local-refine", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--run-mano-multiview-image-refine", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--run-mano-image-candidate-selection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When image refinement is enabled, run baseline and PnP-gated candidates then select per hand by baseline reprojection diagnostics.",
+    )
+    parser.add_argument(
+        "--image-global-initialization",
+        choices=["hamer-virtual", "physical-pnp"],
+        default="physical-pnp",
+        help="Global initializer for image-space refinement. physical-pnp is the recommended rectified-camera path.",
+    )
+    parser.add_argument("--use-mediapipe-2d", choices=["never", "weak", "auto"], default="never")
+    parser.add_argument("--window-size", type=int, default=7)
     parser.add_argument("--optimize-mano-pose", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--optimize-mano-betas", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--allow-frame-beta-delta", action="store_true")
@@ -106,6 +127,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vertex-loss-weight", type=float, default=0.10)
     parser.add_argument("--mano-max-iters", type=int, default=80)
     parser.add_argument("--mano-beta-iters", type=int, default=120)
+    parser.add_argument("--image-soft-reprojection-error-px", type=float, default=90.0)
+    parser.add_argument("--image-soft-mask-distance-px", type=float, default=90.0)
+    parser.add_argument("--image-min-view-weight", type=float, default=0.12)
+    parser.add_argument("--image-anchor-view-weight", type=float, default=1.45)
+    parser.add_argument("--image-min-soft-used-weight", type=float, default=0.08)
+    parser.add_argument("--image-min-metric-used-weight", type=float, default=0.28)
+    parser.add_argument("--image-primary-anchor-score-margin", type=float, default=0.08)
+    parser.add_argument("--image-pnp-view-gate-m", type=float, default=0.04)
+    parser.add_argument(
+        "--image-selection-min-baseline-max-reprojection-px",
+        type=float,
+        default=0.0,
+        help="Prefer every available PnP-gated image-refinement candidate by default; set a positive value for diagnostic-threshold selection.",
+    )
+    parser.add_argument("--image-min-readable-sam3-mask-ratio", type=float, default=0.50)
+    parser.add_argument("--image-projection-correction", type=Path, help="Optional projection correction JSON for image-space MANO refine.")
+    parser.add_argument(
+        "--image-beta-estimation-space",
+        choices=["hamer-local", "image-2d"],
+        default="hamer-local",
+        help="Sequence beta initializer for image refinement; image-2d is the calibrated multi-view experimental path.",
+    )
+    parser.add_argument("--image-beta-max-observations", type=int, default=240)
+    parser.add_argument("--image-beta-prior-weight", type=float, default=2.0)
+    parser.add_argument("--image-temporal-acceleration-weight", type=float, default=0.0)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-mediapipe", action="store_true")
@@ -384,6 +430,7 @@ def main() -> None:
         common_range.extend(["--group-ids", args.group_ids])
     overwrite = ["--overwrite"] if args.overwrite else []
     mediapipe_path = args.mediapipe or (args.base_dir / "landmarks.jsonl")
+    rectified_config_path = args.base_dir / "rectified_for_hamer" / f"rectified_config_{suffix}.json"
 
     rectified_cmd = [
         sys.executable,
@@ -606,8 +653,11 @@ def main() -> None:
                 str(args.base_dir / "hamer_per_view"),
                 "--hamer-root",
                 str(args.hamer_root),
+                "--rectified-config",
+                str(rectified_config_path),
                 "--camera-id",
                 camera_id,
+                "--save-rendered-overlay" if args.save_hamer_rendered_overlays else "--no-save-rendered-overlay",
                 *chunk_range,
                 *overwrite,
             ]
@@ -772,6 +822,111 @@ def main() -> None:
         if args.allow_frame_beta_delta:
             mano_refine_cmd.append("--allow-frame-beta-delta")
         run_command("mano_local_refine", mano_refine_cmd, args.dry_run)
+
+    if args.run_mano_multiview_image_refine and not args.skip_hamer:
+        image_refine_output_dir = (
+            args.base_dir / "hamer_mano_multiview_refined_gated"
+            if args.run_mano_image_candidate_selection
+            else args.base_dir / "hamer_mano_multiview_refined"
+        )
+        mano_image_refine_cmd = [
+            *conda_python(args.conda_bin, args.hamer_conda_env),
+            script_path("refine_hamer_mano_multiview_image.py"),
+            "--predictions",
+            str(hamer_output),
+            "--output-dir",
+            str(image_refine_output_dir),
+            "--hamer-root",
+            str(args.hamer_root),
+            "--calib",
+            str(args.frames.parent / "cameras.yaml"),
+            "--rectified-config",
+            str(rectified_config_path),
+            *(["--projection-correction", str(args.image_projection_correction)] if args.image_projection_correction else []),
+            "--rectify-focal-scale",
+            str(args.rectify_focal_scale),
+            "--min-readable-sam3-mask-ratio",
+            str(args.image_min_readable_sam3_mask_ratio),
+            "--use-mediapipe-2d",
+            args.use_mediapipe_2d,
+            "--global-initialization",
+            args.image_global_initialization,
+            "--window-size",
+            str(args.window_size),
+            "--optimize-mano-pose" if args.optimize_mano_pose else "--no-optimize-mano-pose",
+            "--optimize-mano-betas" if args.optimize_mano_betas else "--no-optimize-mano-betas",
+            "--temporal-error-cap-m",
+            str(args.temporal_error_cap_m),
+            "--temporal-reject-threshold-m",
+            str(args.temporal_reject_threshold_m),
+            "--pose-prior-weight",
+            str(args.pose_prior_weight),
+            "--beta-prior-weight",
+            str(args.beta_prior_weight),
+            "--temporal-pose-weight",
+            str(args.temporal_pose_weight),
+            "--temporal-acceleration-weight",
+            str(args.image_temporal_acceleration_weight),
+            "--soft-reprojection-error-px",
+            str(args.image_soft_reprojection_error_px),
+            "--soft-mask-distance-px",
+            str(args.image_soft_mask_distance_px),
+            "--min-view-weight",
+            str(args.image_min_view_weight),
+            "--anchor-view-weight",
+            str(args.image_anchor_view_weight),
+            "--min-soft-used-weight",
+            str(args.image_min_soft_used_weight),
+            "--min-metric-used-weight",
+            str(args.image_min_metric_used_weight),
+            "--primary-anchor-score-margin",
+            str(args.image_primary_anchor_score_margin),
+            "--pnp-view-gate-m",
+            str(args.image_pnp_view_gate_m),
+            "--max-iters",
+            str(args.mano_max_iters),
+            "--beta-iters",
+            str(args.mano_beta_iters),
+            "--beta-estimation-space",
+            args.image_beta_estimation_space,
+            "--image-beta-max-observations",
+            str(args.image_beta_max_observations),
+            "--image-beta-prior-weight",
+            str(args.image_beta_prior_weight),
+            *common_range,
+            *overwrite,
+        ]
+        if args.allow_frame_beta_delta:
+            mano_image_refine_cmd.append("--allow-frame-beta-delta")
+        # Per-frame overlays are useful for targeted inspection but add heavy I/O
+        # during a production reconstruction. Projection diagnostics remain in JSON.
+        mano_image_refine_cmd.append("--no-save-debug-overlays")
+        if args.use_mediapipe_2d != "never":
+            mano_image_refine_cmd.extend(["--mediapipe", str(mediapipe_path)])
+        if args.run_mano_image_candidate_selection:
+            baseline_cmd = list(mano_image_refine_cmd)
+            baseline_cmd[baseline_cmd.index("--output-dir") + 1] = str(args.base_dir / "hamer_mano_multiview_refined_baseline")
+            baseline_cmd[baseline_cmd.index("--pnp-view-gate-m") + 1] = "0"
+            run_command("mano_multiview_image_refine_baseline", baseline_cmd, args.dry_run)
+            run_command("mano_multiview_image_refine_gated", mano_image_refine_cmd, args.dry_run)
+            baseline_output = args.base_dir / "hamer_mano_multiview_refined_baseline" / f"mano_multiview_local_hands_{suffix}.jsonl"
+            gated_output = args.base_dir / "hamer_mano_multiview_refined_gated" / f"mano_multiview_local_hands_{suffix}.jsonl"
+            selection_cmd = [
+                sys.executable,
+                script_path("select_image_refinement_candidates.py"),
+                "--baseline",
+                str(baseline_output),
+                "--gated",
+                str(gated_output),
+                "--output",
+                str(args.base_dir / "hamer_mano_multiview_selected" / f"mano_multiview_local_hands_{suffix}.jsonl"),
+                "--min-baseline-max-reprojection-px",
+                str(args.image_selection_min_baseline_max_reprojection_px),
+                *overwrite,
+            ]
+            run_command("mano_multiview_image_select", selection_cmd, args.dry_run)
+        else:
+            run_command("mano_multiview_image_refine", mano_image_refine_cmd, args.dry_run)
 
 
 if __name__ == "__main__":

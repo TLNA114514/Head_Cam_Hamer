@@ -281,6 +281,8 @@ def masked_blur_frame(
 def load_mask(mask_path: str | None, image_size: tuple[int, int] = IMAGE_SIZE) -> np.ndarray | None:
     if not mask_path:
         return None
+    if not Path(mask_path).exists():
+        return None
     mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
     if mask is None:
         return None

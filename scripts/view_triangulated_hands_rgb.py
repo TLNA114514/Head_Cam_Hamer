@@ -75,6 +75,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="MediaPipe per-camera landmarks JSONL. Defaults to TRIANGULATED parent parent / landmarks.jsonl.",
     )
+    parser.add_argument("--hamer-predictions", type=Path, help="HaMeR per-view prediction JSONL for rectified 2D overlays.")
+    parser.add_argument("--no-hamer-overlay", action="store_true", help="Do not draw HaMeR/refined 2D overlays on RGB panes.")
     parser.add_argument("--image-root", type=Path, default=Path("video/cameras_left_index"), help="Image root.")
     parser.add_argument("--calib", type=Path, default=Path("video/cameras_left_index/cameras.yaml"), help="Camera calibration YAML.")
     parser.add_argument("--no-mediapipe-overlay", action="store_true", help="Show raw RGB images without MediaPipe 2D overlay.")
@@ -136,6 +138,19 @@ def load_mediapipe_detections(detections_path: Path) -> dict[int, dict[str, dict
         camera_id = record["camera_id"]
         detections.setdefault(group_id, {})[camera_id] = record
     return detections
+
+
+def load_hamer_predictions(path: Path | None) -> dict[int, dict[str, list[dict[str, Any]]]]:
+    predictions: dict[int, dict[str, list[dict[str, Any]]]] = {}
+    if path is None or not path.exists():
+        return predictions
+    for record in iter_jsonl(path):
+        if record.get("type") != "hamer_multiview_prediction":
+            continue
+        group_id = int(record["group_id"])
+        camera_id = str(record["camera_id"])
+        predictions.setdefault(group_id, {}).setdefault(camera_id, []).append(record)
+    return predictions
 
 
 def load_camera_poses(calib_path: Path) -> dict[str, tuple[np.ndarray, np.ndarray]]:
@@ -213,13 +228,13 @@ def load_triangulated_frames(path: Path, stride: int, max_frames: int | None, gr
     frames = []
     for source_index, record in enumerate(iter_jsonl(path)):
         record_type = record.get("type")
-        if record_type not in {"triangulated_mediapipe_hand_frame", "hand_local_refined_frame", "hamer_primary_local_frame", "hamer_mano_local_refined_frame", "glove_local_frame"}:
+        if record_type not in {"triangulated_mediapipe_hand_frame", "hand_local_refined_frame", "hamer_primary_local_frame", "hamer_mano_local_refined_frame", "hamer_mano_multiview_image_refined_frame", "glove_local_frame"}:
             continue
         if group_ids is not None and int(record["group_id"]) not in group_ids:
             continue
         if source_index % stride != 0:
             continue
-        if record_type in {"hamer_primary_local_frame", "hamer_mano_local_refined_frame"}:
+        if record_type in {"hamer_primary_local_frame", "hamer_mano_local_refined_frame", "hamer_mano_multiview_image_refined_frame"}:
             record = normalize_hamer_local_frame(record)
         frames.append(record)
         if max_frames is not None and len(frames) >= max_frames:
@@ -228,7 +243,7 @@ def load_triangulated_frames(path: Path, stride: int, max_frames: int | None, gr
 
 
 def is_refined_frame(frame: dict[str, Any]) -> bool:
-    return frame.get("type") in {"hand_local_refined_frame", "hamer_primary_local_frame", "hamer_mano_local_refined_frame", "glove_local_frame"}
+    return frame.get("type") in {"hand_local_refined_frame", "hamer_primary_local_frame", "hamer_mano_local_refined_frame", "hamer_mano_multiview_image_refined_frame", "glove_local_frame"}
 
 
 def joint_position_for_space(hand: dict[str, Any], joint: dict[str, Any], space: str, refined: bool) -> list[float] | None:
@@ -422,6 +437,69 @@ def draw_mediapipe_overlay_bgr(image: np.ndarray, detection: dict[str, Any] | No
     return hand_count
 
 
+def draw_2d_hand_bgr(image: np.ndarray, points: list[Any], color: tuple[int, int, int], label: str | None = None, radius: int = 4) -> int:
+    valid_points: dict[int, tuple[int, int]] = {}
+    for index, point in enumerate(points[:21]):
+        if isinstance(point, dict):
+            x = point.get("x")
+            y = point.get("y")
+        elif isinstance(point, list) and len(point) >= 2:
+            x, y = point[0], point[1]
+        else:
+            continue
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            continue
+        x_i = int(round(float(x)))
+        y_i = int(round(float(y)))
+        if 0 <= x_i < image.shape[1] and 0 <= y_i < image.shape[0]:
+            valid_points[index] = (x_i, y_i)
+    if not valid_points:
+        return 0
+    import cv2
+
+    for start, end in HAND_CONNECTIONS:
+        a = valid_points.get(start)
+        b = valid_points.get(end)
+        if a is not None and b is not None:
+            cv2.line(image, a, b, color, 2, cv2.LINE_AA)
+    for index, xy in valid_points.items():
+        cv2.circle(image, xy, radius + (1 if index == 0 else 0), color, -1, cv2.LINE_AA)
+    if label and 0 in valid_points:
+        wrist = valid_points[0]
+        cv2.putText(image, label, (wrist[0] + 8, max(18, wrist[1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 3, cv2.LINE_AA)
+        cv2.putText(image, label, (wrist[0] + 8, max(18, wrist[1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+    return 1
+
+
+def draw_hamer_overlay_bgr(
+    image: np.ndarray,
+    predictions: list[dict[str, Any]],
+    frame: dict[str, Any],
+    camera_id: str,
+) -> int:
+    count = 0
+    for pred in predictions:
+        handedness = pred.get("handedness", "hand")
+        color = (219, 156, 45) if handedness == "Left" else (87, 87, 235)
+        points = pred.get("hamer_joints_2d_rectified_px") or []
+        count += draw_2d_hand_bgr(image, points, (120, 120, 120), f"H2D {handedness}", radius=3)
+
+    for hand in frame.get("hands") or []:
+        projection = (hand.get("projection_debug") or {}).get(camera_id)
+        if not projection:
+            continue
+        handedness = hand.get("handedness", "hand")
+        used = bool(projection.get("used"))
+        color = (220, 180, 45) if handedness == "Left" else (70, 90, 235)
+        if not used:
+            color = (90, 90, 90)
+        err = projection.get("mean_reprojection_error_px")
+        err_text = f"{float(err):.1f}px" if isinstance(err, (int, float)) else "-"
+        label = f"ref {handedness} {'used' if used else 'rej'} {err_text}"
+        count += draw_2d_hand_bgr(image, projection.get("joints_2d_px") or [], color, label, radius=4)
+    return count
+
+
 class RgbSkeletonViewer:
     def __init__(
         self,
@@ -429,12 +507,14 @@ class RgbSkeletonViewer:
         frames: list[dict[str, Any]],
         frame_images: dict[int, dict[str, str]],
         detections: dict[int, dict[str, dict[str, Any]]],
+        hamer_predictions: dict[int, dict[str, list[dict[str, Any]]]],
         camera_poses: dict[str, tuple[np.ndarray, np.ndarray]],
     ) -> None:
         self.args = args
         self.frames = frames
         self.frame_images = frame_images
         self.detections = detections
+        self.hamer_predictions = hamer_predictions
         self.camera_poses = camera_poses
         self.index = 0
         self.paused = False
@@ -495,18 +575,30 @@ class RgbSkeletonViewer:
             self.index = len(self.frames) - 1
             self.draw_current()
 
-    def read_rgb(self, group_id: int, camera_id: str) -> tuple[np.ndarray, int]:
+    def read_rgb(self, frame: dict[str, Any], camera_id: str) -> tuple[np.ndarray, int]:
         import cv2
 
+        group_id = int(frame["group_id"])
+        hamer_items = [] if self.args.no_hamer_overlay else self.hamer_predictions.get(group_id, {}).get(camera_id, [])
+        rectified_path = None
+        for item in hamer_items:
+            if item.get("rectified_image_path"):
+                rectified_path = Path(item["rectified_image_path"])
+                break
         rel_path = self.frame_images.get(group_id, {}).get(camera_id)
-        if rel_path is None:
+        if rectified_path is not None:
+            path = rectified_path
+        elif rel_path is not None:
+            path = self.args.image_root / rel_path
+        else:
             return np.zeros((600, 800, 3), dtype=np.uint8), 0
-        path = self.args.image_root / rel_path
         bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if bgr is None:
             return np.zeros((600, 800, 3), dtype=np.uint8), 0
         hand_count = 0
-        if not self.args.no_mediapipe_overlay:
+        if hamer_items:
+            hand_count = draw_hamer_overlay_bgr(bgr, hamer_items, frame, camera_id)
+        elif not self.args.no_mediapipe_overlay:
             detection = self.detections.get(group_id, {}).get(camera_id)
             hand_count = draw_mediapipe_overlay_bgr(bgr, detection)
         if self.args.image_downscale > 1:
@@ -564,14 +656,14 @@ class RgbSkeletonViewer:
         beta_sources = frame_anchor_beta_sources(frame)
 
         for camera_id, artist in self.image_artists.items():
-            rgb, hand_count = self.read_rgb(group_id, camera_id)
+            rgb, hand_count = self.read_rgb(frame, camera_id)
             artist.set_data(rgb)
             anchor_text = "".join(anchor_labels.get(camera_id, [])) or "-"
             err_values = pose_errors.get(camera_id, [])
             err_text = f"{np.mean(err_values):.3f}" if err_values else "-"
             beta_text = ",".join(sorted(set(beta_sources.get(camera_id, [])))) or "-"
             self.image_axes[camera_id].set_title(
-                f"{camera_id}  group {group_id}  MP hands={hand_count}  "
+                f"{camera_id}  group {group_id}  2D hands={hand_count}  "
                 f"anchor={anchor_text}  used={used_camera_counts.get(camera_id, 0)}  rej={rejected_camera_counts.get(camera_id, 0)}  "
                 f"err={err_text} beta={beta_text}",
                 fontsize=11,
@@ -712,7 +804,7 @@ def main() -> None:
         raise SystemExit(f"calib file not found: {args.calib}")
     if args.detections is None:
         args.detections = args.triangulated.parent.parent / "landmarks.jsonl"
-    if not args.no_mediapipe_overlay and not args.detections.exists():
+    if not args.no_mediapipe_overlay and not args.detections.exists() and (args.hamer_predictions is None or not args.hamer_predictions.exists()):
         raise SystemExit(f"detections file not found: {args.detections}")
 
     frames = load_triangulated_frames(args.triangulated, args.stride, args.max_frames, parse_group_range(args.group_range))
@@ -720,10 +812,11 @@ def main() -> None:
     if not frames:
         raise SystemExit("no triangulated hand frames found")
     frame_images = load_frame_images(args.frames)
-    detections = {} if args.no_mediapipe_overlay else load_mediapipe_detections(args.detections)
+    detections = {} if args.no_mediapipe_overlay or not args.detections.exists() else load_mediapipe_detections(args.detections)
+    hamer_predictions = load_hamer_predictions(args.hamer_predictions)
     camera_poses = load_camera_poses(args.calib) if args.show_camera_rig else {}
 
-    viewer = RgbSkeletonViewer(args, frames, frame_images, detections, camera_poses)
+    viewer = RgbSkeletonViewer(args, frames, frame_images, detections, hamer_predictions, camera_poses)
     viewer.draw_current()
     animation = FuncAnimation(viewer.fig, viewer.update, interval=args.interval_ms, blit=False)
     viewer.animation = animation

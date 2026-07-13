@@ -44,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_BASE_DIR / "hamer_per_view")
     parser.add_argument("--hamer-root", type=Path, default=DEFAULT_HAMER_ROOT)
     parser.add_argument("--checkpoint", type=str)
+    parser.add_argument("--rectified-config", type=Path, help="Rectified cache config JSON with per-camera new intrinsics.")
     parser.add_argument("--group-range")
     parser.add_argument("--group-ids")
     parser.add_argument("--camera-id", help="Optional single camera shard.")
@@ -154,6 +155,82 @@ def choose_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
     )
 
 
+def load_rectified_intrinsics(path: Path | None) -> tuple[dict[str, list[list[float]]], str | None]:
+    if path is None or not path.exists():
+        return {}, None
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    intrinsics = data.get("new_intrinsics") or {}
+    return {str(key): value for key, value in intrinsics.items()}, str(path)
+
+
+def bbox_area_score(bbox: list[float] | np.ndarray | None, image_shape: tuple[int, int, int]) -> float:
+    if bbox is None or len(bbox) != 4:
+        return 0.0
+    img_h, img_w = image_shape[:2]
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    area_ratio = max(0.0, x2 - x1) * max(0.0, y2 - y1) / float(max(1, img_w * img_h))
+    if area_ratio <= 0.0:
+        return 0.0
+    if area_ratio < 0.003:
+        return float(np.clip(area_ratio / 0.003, 0.0, 1.0))
+    if area_ratio > 0.12:
+        return float(np.clip(0.12 / area_ratio, 0.0, 1.0))
+    return 1.0
+
+
+def bbox_edge_score(bbox: list[float] | np.ndarray | None, image_shape: tuple[int, int, int]) -> float:
+    if bbox is None or len(bbox) != 4:
+        return 0.0
+    img_h, img_w = image_shape[:2]
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    margin = min(x1, y1, float(img_w) - x2, float(img_h) - y2)
+    return float(np.clip((margin + 20.0) / 80.0, 0.0, 1.0))
+
+
+def keypoints_2d_to_full_image(
+    pred_keypoints_2d: torch.Tensor,
+    box_center: torch.Tensor,
+    box_size: torch.Tensor,
+    is_right: int,
+) -> np.ndarray:
+    points = pred_keypoints_2d.detach().cpu().float().clone()
+    points[:, 0] = float(2 * int(is_right) - 1) * points[:, 0]
+    center = box_center.detach().cpu().float()
+    size = box_size.detach().cpu().float()
+    return (points * size.reshape(1, 1) + center.reshape(1, 2)).numpy()
+
+
+def joint_confidences(
+    points: np.ndarray,
+    bbox: list[float] | np.ndarray,
+    mask_path: str | None,
+    mask_score: float | None,
+    image_shape: tuple[int, int, int],
+) -> list[float]:
+    img_h, img_w = image_shape[:2]
+    mask = load_mask(mask_path, image_size=(img_w, img_h))
+    bbox_score = bbox_area_score(bbox, image_shape)
+    edge_score = bbox_edge_score(bbox, image_shape)
+    mask_component = float(np.clip(mask_score if mask_score is not None else 0.35, 0.0, 1.0))
+    base = 0.20 + 0.35 * bbox_score + 0.20 * edge_score + 0.25 * mask_component
+    confidences = []
+    for x, y in points[:21]:
+        in_bounds = 0.0 <= float(x) < float(img_w) and 0.0 <= float(y) < float(img_h)
+        if not in_bounds:
+            confidences.append(0.0)
+            continue
+        mask_factor = 1.0
+        if mask is not None:
+            xi = int(round(float(x)))
+            yi = int(round(float(y)))
+            xi = int(np.clip(xi, 0, img_w - 1))
+            yi = int(np.clip(yi, 0, img_h - 1))
+            mask_factor = 1.0 if bool(mask[yi, xi]) else 0.45
+        confidences.append(float(np.clip(base * mask_factor, 0.0, 1.0)))
+    return confidences
+
+
 def score_candidates_with_mask(
     candidates: list[dict[str, Any]],
     mask_path: str | None,
@@ -221,6 +298,9 @@ def main() -> None:
         raise SystemExit(f"{output_path} exists; pass --overwrite to replace it")
     if not jobs_path.exists():
         raise SystemExit(f"jobs not found: {jobs_path}")
+    if args.rectified_config is not None and not args.rectified_config.is_absolute():
+        args.rectified_config = original_cwd / args.rectified_config
+    rectified_intrinsics, rectified_intrinsics_source = load_rectified_intrinsics(args.rectified_config)
 
     args.hamer_root = args.hamer_root.expanduser().resolve()
     if not args.hamer_root.exists():
@@ -292,6 +372,12 @@ def main() -> None:
                     is_right = int(batch["right"][n].detach().cpu().item())
                     verts = pred["pred_vertices"][n].detach().cpu().numpy()
                     joints = pred["pred_keypoints_3d"][n].detach().cpu().numpy()
+                    keypoints_2d = keypoints_2d_to_full_image(
+                        pred["pred_keypoints_2d"][n],
+                        box_center[n],
+                        box_size[n],
+                        is_right,
+                    )
                     verts[:, 0] = (2 * is_right - 1) * verts[:, 0]
                     joints[:, 0] = (2 * is_right - 1) * joints[:, 0]
                     candidates.append(
@@ -299,12 +385,16 @@ def main() -> None:
                             "handedness": rec["handedness"],
                             "is_right": is_right,
                             "hypothesis_status": rec["hypothesis_status"],
+                            "bbox": rec["bbox"],
                             "bbox_scale": rec["bbox_scale"],
                             "verts": verts,
                             "joints": joints,
                             "raw_verts": pred["pred_vertices"][n].detach().cpu().numpy(),
                             "cam_t": pred_cam_t_full[n],
                             "pred_cam_t": pred["pred_cam_t"][n].detach().cpu().numpy(),
+                            "keypoints_2d": keypoints_2d,
+                            "bbox_center": box_center[n].detach().cpu().numpy(),
+                            "bbox_size": float(box_size[n].detach().cpu().item()),
                             "mano_params_rotmat": detach_mano_params(pred, n),
                             "batch_img": batch["img"][n].detach().cpu(),
                             "mask_score": None,
@@ -356,13 +446,30 @@ def main() -> None:
                 "rectified_image_path": job.get("rectified_image_path"),
                 "hamer_frame_path": job.get("hamer_frame_path"),
                 "used_mask_blur": bool(job.get("used_mask_blur")),
+                "sam3_mask_path": job.get("sam3_mask_path"),
+                "track_id": job.get("track_id"),
+                "locked_handedness": job.get("locked_handedness"),
+                "handedness_confidence": job.get("handedness_confidence"),
                 "hamer_joints_cam": selected["joints"].tolist(),
                 "hamer_vertices_cam": selected["verts"].tolist(),
+                "hamer_joints_2d_rectified_px": selected["keypoints_2d"][:21].tolist(),
+                "hamer_joints_2d_conf": joint_confidences(
+                    selected["keypoints_2d"],
+                    selected.get("bbox", job["bbox_rectified_px"]),
+                    job.get("sam3_mask_path"),
+                    selected.get("mask_score"),
+                    img_cv2.shape,
+                ),
                 "hamer_cam_t": selected["cam_t"].tolist(),
                 "hamer_pred_cam_t": selected["pred_cam_t"].tolist(),
+                "hamer_focal_length": float(last_scaled_focal_length.detach().cpu().item()) if torch.is_tensor(last_scaled_focal_length) else float(last_scaled_focal_length),
+                "hamer_bbox_center": selected["bbox_center"].tolist(),
+                "hamer_bbox_size": float(selected["bbox_size"]),
                 "mano_params_rotmat": selected.get("mano_params_rotmat"),
                 "mano_param_source": "hamer" if selected.get("mano_params_rotmat") else None,
                 "bbox_scale": float(selected["bbox_scale"]),
+                "rectified_K": rectified_intrinsics.get(str(job["camera_id"])),
+                "rectified_K_source": rectified_intrinsics_source,
                 "mask_score": selected.get("mask_score"),
                 "mask_iou": selected.get("mask_iou"),
                 "rendered_overlay_path": str(render_path) if render_path else None,

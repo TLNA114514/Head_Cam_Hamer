@@ -43,7 +43,11 @@ __pycache__/
 .codex/
 .venv/
 venv/
-gloves/
+gloves/glove_local
+gloves/left_index_hamer_eval
+gloves/right_index_hamer_eval
+gloves/pn3_leftindex.csv
+gloves/pn3_rightindex.csv
 # OS/editor noise
 .DS_Store
 *.swp

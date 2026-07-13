@@ -139,6 +139,39 @@ def repair_duplicate_mediapipe_handedness(hands: list[dict[str, Any]]) -> int:
     return 1
 
 
+def resolve_sam3_asset_path(raw_path: str | None, source_jsonl: Path) -> str | None:
+    if not raw_path:
+        return None
+    raw = Path(raw_path)
+    if raw.exists():
+        return str(raw)
+
+    raw_parts = raw.parts
+    candidates: list[Path] = []
+    if "masks" in raw_parts:
+        mask_tail = Path(*raw_parts[raw_parts.index("masks") :])
+        candidates.append(source_jsonl.parent / mask_tail)
+
+    source_parts = source_jsonl.parts
+    source_base: Path | None = None
+    for marker in ("sam3_bboxes", "sam3_tracks", "sam3_tracks_stabilized"):
+        if marker in source_parts:
+            marker_index = source_parts.index(marker)
+            source_base = Path(*source_parts[:marker_index]) if marker_index > 0 else Path(".")
+            break
+    if source_base is not None and "chunks" in raw_parts:
+        chunks_index = raw_parts.index("chunks")
+        # Track metadata can carry the original SAM3-bbox relative path from
+        # another base directory. Keep the `chunks/` component when relocating
+        # it; dropping it made valid left-sequence masks silently disappear.
+        candidates.append(source_base / "sam3_bboxes" / Path(*raw_parts[chunks_index:]))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 def load_sam3(path: Path, cameras: set[str], group_ids: set[int] | None) -> dict[tuple[int, str], list[dict[str, Any]]]:
     data: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
     for record in iter_jsonl(path):
@@ -154,6 +187,7 @@ def load_sam3(path: Path, cameras: set[str], group_ids: set[int] | None) -> dict
                 continue
             item = dict(hand)
             item["bbox"] = [float(v) for v in bbox]
+            item["mask_path"] = resolve_sam3_asset_path(item.get("mask_path"), path)
             if item.get("locked_handedness") in {"Left", "Right"}:
                 item["handedness"] = item["locked_handedness"]
             data[(group_id, camera_id)].append(item)

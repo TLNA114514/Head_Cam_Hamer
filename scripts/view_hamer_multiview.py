@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
         help="Quickly view a glove JSONL instead of HaMeR output.",
     )
     parser.add_argument("--detections", type=Path, help="MediaPipe landmarks JSONL. Defaults to base-dir/landmarks.jsonl.")
+    parser.add_argument("--hamer-predictions", type=Path, help="HaMeR per-view predictions JSONL for 2D overlay.")
     parser.add_argument("--group-range", help='Inclusive group range, e.g. "1-100".')
     parser.add_argument("--range", dest="range_alias", help='Short alias for --group-range, e.g. "0-442".')
     parser.add_argument("--group-ids", help='Comma-separated ids, e.g. "1,7,42"; only used for file suffix selection.')
@@ -65,6 +66,15 @@ def parse_args() -> argparse.Namespace:
 
 def default_triangulated_path(base_dir: Path, group_range: str | None, group_ids: str | None) -> Path:
     suffix = range_suffix(parse_group_ids(group_range, group_ids))
+    selected = base_dir / "hamer_mano_multiview_selected" / f"mano_multiview_local_hands_{suffix}.jsonl"
+    if selected.exists():
+        return selected
+    soft_refined = base_dir / "hamer_mano_multiview_soft_refined" / f"mano_multiview_local_hands_{suffix}.jsonl"
+    if soft_refined.exists():
+        return soft_refined
+    image_refined = base_dir / "hamer_mano_multiview_refined" / f"mano_multiview_local_hands_{suffix}.jsonl"
+    if image_refined.exists():
+        return image_refined
     refined = base_dir / "hamer_mano_local_refined" / f"mano_local_hands_{suffix}.jsonl"
     if refined.exists():
         return refined
@@ -115,6 +125,7 @@ def main() -> None:
     viewer = Path(__file__).resolve().parent / "view_triangulated_hands_rgb.py"
     triangulated = args.triangulated or default_triangulated_path(args.base_dir, args.group_range, args.group_ids)
     detections = args.detections or (args.base_dir / "landmarks.jsonl")
+    hamer_predictions = args.hamer_predictions or (args.base_dir / "hamer_per_view" / f"hamer_predictions_{range_suffix(parse_group_ids(args.group_range, args.group_ids))}.jsonl")
 
     command = [
         sys.executable,
@@ -148,6 +159,8 @@ def main() -> None:
         "--mesh-stride",
         str(args.mesh_stride),
     ]
+    if hamer_predictions.exists():
+        command.extend(["--hamer-predictions", str(hamer_predictions)])
     if args.group_range:
         command.extend(["--group-range", args.group_range])
     if args.max_frames is not None:
