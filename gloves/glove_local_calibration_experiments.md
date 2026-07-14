@@ -1,6 +1,8 @@
 # Glove-Local Calibration Experiments
 
 Full Chinese translation: `gloves/glove_local_calibration_experiments.zh.md`.
+Inference speed, latency, and replacement-model research is kept separately in
+`docs/hamer_inference_optimization.md`.
 
 ## Plain-Language Summary
 
@@ -25,12 +27,17 @@ layer trained with glove GT. The raw MANO output is still preserved as
 
 ### What To Use Now
 
+- For in-the-wild / zero-shot palm-local joints, use
+  `hamer_palm_local_fused/`. Its default primary field is the unmodified
+  cross-view mean; optional temporal results are stored in separate fields.
 - For glove-supervised local coordinates, use `hamer_mano_local_refined/` plus
-  the static calibration layer.
+  the static calibration layer only when glove calibration is explicitly part
+  of the task. This is not the deployment default.
 - For dense in-distribution analysis where the calibration motions are well
   covered, `dense KNN + OOD guard` gives the lowest numbers.
 - For no-GT image-side visualization/debugging, use
-  `hamer_mano_multiview_selected/`.
+  `hamer_mano_multiview_selected/` when a MANO mesh is required; use the new
+  zero-shot output for the strongest skeleton-only palm-local result.
 - Do not use `hamer_mano_multiview_selected/` as the default base for
   glove-supervised calibration; it is better for image-side viewing, but worse
   after glove calibration.
@@ -626,3 +633,129 @@ being promoted on a weak result. The more consequential remaining gap is a
 proper two-sided SAM3 silhouette objective; the installed environment has no
 PyTorch3D, nvdiffrast, or Kaolin renderer, so that should be implemented as an
 explicit renderer dependency or a carefully validated lightweight alternative.
+
+## Zero-Shot Direct Multi-View Palm Fusion
+
+The deployment goal is in-the-wild and zero-shot, so glove data must not be an
+input to the fusion method. `scripts/fuse_hamer_palm_local.py` implements a new
+path with that constraint:
+
+1. Convert every per-view HaMeR result into its own canonical palm frame.
+2. Use image quality only to choose between duplicate hypotheses from the same
+   camera.
+3. Give the selected cameras equal weight and average corresponding joints.
+4. Preserve that result in `raw_palm_local_joints_m` unconditionally.
+5. Store static shape calibration, causal EMA, and offline Gaussian smoothing
+   in separate fields; none of them overwrite the raw result unless explicitly
+   selected with `--primary-output`.
+
+The generated config writes `uses_ground_truth: false`,
+`cross_view_weighting: equal`, and the exact output-field choice. The main
+pipeline runs this stage by default, but keeps `--zero-shot-primary-output raw`,
+zero bone calibration, and zero temporal smoothing as the deployment-safe
+defaults.
+
+### Why Equal View Weights
+
+Image quality and cross-view agreement were evaluated as possible no-GT
+reliability signals. Neither was reliable enough to gate the pose:
+
+- quality-score/error correlation was `-0.18` on left-index and `+0.10` on
+  right-index;
+- consensus-spread/error correlation was `-0.089` and `+0.019`;
+- per-joint Huber fusion improved left mean slightly but damaged right mean and
+  tail error because C3 was sometimes the most accurate view while also being
+  the least consensus-like view.
+
+Therefore quality scores are deliberately limited to within-camera duplicate
+selection. Cross-view disagreement is exported as diagnostic uncertainty, not
+used as an accuracy confidence or hard rejection gate.
+
+### Zero-Shot Results
+
+All numbers below use glove only after inference as an evaluation ruler. The
+fusion output itself never reads glove files, labels, calibration parameters,
+or residual models. Metrics cover all five fingers over the full left 0--442
+and right 0--477 sequences.
+
+| Zero-shot output | left mean / median / P95 / max | right mean / median / P95 / max |
+| --- | ---: | ---: |
+| Previous MANO local refine | 30.12 / 27.45 / 59.70 / 139.68 mm | 38.83 / 32.56 / 89.36 / 130.46 mm |
+| Direct equal-view mean, raw | 28.47 / 26.10 / 53.68 / 111.67 mm | 35.50 / 30.27 / 77.33 / 130.17 mm |
+| Direct mean + causal EMA `alpha=0.20` | 27.45 / 25.18 / 51.89 / 101.28 mm | 34.55 / 29.51 / 74.26 / 121.15 mm |
+| Direct mean + adaptive causal One Euro | **27.07 / 24.83 / 51.59 / 101.16 mm** | **34.02 / 28.85 / 73.32 / 117.62 mm** |
+| Direct mean + offline Gaussian `radius=10,sigma=4` | **27.37 / 25.08 / 51.47 / 93.92 mm** | **34.31 / 29.40 / 73.06 / 120.25 mm** |
+
+The Gaussian result is an offline option with a ten-frame look-ahead, not a
+causal deployment claim. All temporal filters reset at missing detections, so
+they do not drag an old hand state across a gap. The raw field remains the
+authoritative observation in every mode.
+
+The adaptive causal result uses the timestamp-derived frame rate (about 25 FPS) with
+`min_cutoff=0.2`, `beta=5.0`, and derivative cutoff `1.0`. Parameters were selected
+on even groups and then checked on held-out odd groups. On odd groups it reached
+`27.05/51.46mm` on left and `33.98/73.29mm` on right (mean/P95), versus fixed
+EMA's `27.44/51.69mm` and `34.51/74.11mm`. It uses no look-ahead and no glove
+input at inference; the pipeline computes this optional field by default while
+keeping raw as the primary output.
+
+### Static Calibration Without Pose Supervision
+
+An optional zero-shot static bone calibration estimates a camera-balanced
+median bone length per hand and reconstructs every bone along its original
+per-frame direction. It changes shape length only; it does not fit pose
+residuals or use glove. On these sequences its effect was below `0.1mm` in mean
+and P95, while the worst-case effect was mixed, so `--bone-calibration-blend`
+remains `0` by default. This is useful as a conservative shape-normalization
+experiment, not as evidence for a default accuracy gain.
+
+SO(3) averaging of the 15 MANO joint rotations was also tested. It retains a
+strictly valid MANO parameterization, but even with the same offline temporal
+window it reached `28.74/53.89mm` on left and `35.47/78.01mm` on right
+(mean/P95), worse than direct joint correspondence fusion. It is therefore a
+mesh-valid fallback direction rather than the joint-accuracy default.
+
+### Geometry Branch Fixes and Limits
+
+`scripts/triangulate_mediapipe_hands.py` previously assumed detections were
+contiguous by `group_id`, while the actual JSONL is grouped by camera. Every
+record was consequently treated as a one-camera group and zero hands could be
+triangulated. The loader now groups all records by `group_id` explicitly, and
+the script can optionally use stabilized SAM3 tracks for bbox-only hand
+association via `--tracked-hands`.
+
+After grouping, track association, and a `0.05--1.0m` positive-depth gate,
+strict MediaPipe triangulation produced 396 left-sequence and 415 right-sequence
+hand instances. Complete-pose mean/P95 remained `41.31/76.63mm` and
+`48.11/99.06mm`, so this is still not accurate or complete enough to replace
+HaMeR fusion. Direct triangulation of
+HaMeR-rendered 2D joints was also rejected: virtual-camera/physical-camera
+mismatch created severe depth failures. Geometry is retained as a diagnostic
+branch until identity association and physical 2D observations are reliable.
+
+### Commands
+
+Deployment-safe raw fusion with optional outputs retained separately:
+
+```bash
+/home/luojiangrui/miniconda3/envs/headcam/bin/python scripts/fuse_hamer_palm_local.py \
+  --predictions video/sam3_hamer_left_index/hamer_per_view/hamer_predictions_000000_000442.jsonl \
+  --output-dir video/sam3_hamer_left_index/hamer_palm_local_fused \
+  --group-range 0-442 \
+  --temporal-radius 10 \
+  --temporal-sigma 4 \
+  --causal-ema-alpha 0.20 \
+  --one-euro-min-cutoff 0.2 \
+  --one-euro-beta 5.0 \
+  --primary-output raw \
+  --overwrite
+```
+
+Use `--primary-output adaptive-causal` for the validated causal result, or
+`--primary-output smoothed` only for an explicitly offline result. View the
+raw zero-shot skeleton with:
+
+```bash
+/home/luojiangrui/miniconda3/envs/headcam/bin/python scripts/view_hamer_multiview.py \
+  --dataset left_index --range 0-442 --zero-shot
+```

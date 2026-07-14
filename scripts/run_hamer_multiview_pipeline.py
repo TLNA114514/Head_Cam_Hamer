@@ -9,6 +9,8 @@ import os
 import signal
 import subprocess
 import sys
+import time
+from statistics import median
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from queue import Queue
@@ -28,7 +30,11 @@ ACTIVE_PROCS: set[subprocess.Popen] = set()
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-dir", type=Path, default=DEFAULT_BASE_DIR)
-    parser.add_argument("--frames", type=Path, default=DEFAULT_FRAMES)
+    parser.add_argument(
+        "--frames",
+        type=Path,
+        help="Frame metadata JSONL. Defaults to the cameras_<dataset>/frames.jsonl matching --base-dir.",
+    )
     parser.add_argument("--mediapipe", type=Path, help="MediaPipe landmarks JSONL. Defaults to base-dir/landmarks.jsonl.")
     parser.add_argument("--rectify-focal-scale", type=float, default=0.30)
     parser.add_argument("--group-range")
@@ -38,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-size", type=int, default=50)
     parser.add_argument("--max-parallel-workers", type=int, default=2)
     parser.add_argument("--max-mediapipe-workers", type=int, default=4)
+    parser.add_argument("--max-hamer-workers", type=int, default=1)
     parser.add_argument("--conda-bin", default="/home/luojiangrui/miniconda3/bin/conda")
     parser.add_argument("--sam3-conda-env", default="sam3hand")
     parser.add_argument("--hamer-conda-env", default="hamer")
@@ -46,7 +53,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sam3-no-hf", action="store_true", help="Do not allow SAM3 to download checkpoints from HuggingFace.")
     parser.add_argument("--sam3-hf-endpoint", default="https://hf-mirror.com", help="HF endpoint used by SAM3 downloads.")
     parser.add_argument("--sam3-version", choices=["sam3", "sam3.1"], default="sam3.1", help="SAM3 native video tracker version.")
+    parser.add_argument(
+        "--sam3-execution",
+        choices=["per-sequence", "per-chunk"],
+        default="per-sequence",
+        help="Load the SAM3 image model once per sequence or once per camera/chunk.",
+    )
+    parser.add_argument(
+        "--save-sam3-debug",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Save full-frame SAM3 bbox and mask debug images.",
+    )
     parser.add_argument("--hamer-root", type=Path, default=WRIST_CAM_ROOT / "third_party" / "hamer")
+    parser.add_argument(
+        "--hamer-execution",
+        choices=["per-sequence", "per-camera", "per-chunk"],
+        default="per-sequence",
+        help="Load HaMeR once per sequence (fastest), per camera, or per camera/chunk (legacy resume granularity).",
+    )
+    parser.add_argument(
+        "--hamer-speed-profile",
+        choices=["quality", "balanced", "fast", "aggressive"],
+        default="quality",
+        help="quality keeps mesh scoring/FP32; aggressive keeps three scales but uses FP16, skeleton scoring, and compile.",
+    )
+    parser.add_argument("--hamer-batch-size", type=int, default=4)
+    parser.add_argument("--hamer-job-batch-size", type=int, default=8)
+    parser.add_argument("--hamer-candidate-bbox-scales")
+    parser.add_argument("--hamer-candidate-scale-policy", choices=["fixed", "mask-adaptive"])
+    parser.add_argument("--hamer-precision", choices=["float32", "float16", "bfloat16"])
+    parser.add_argument("--hamer-allow-tf32", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--hamer-mask-scoring", choices=["all", "selection-only", "none"])
+    parser.add_argument("--hamer-mask-score-method", choices=["mesh", "skeleton"])
+    parser.add_argument("--hamer-compile-backbone", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--hamer-compile-mode",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        default="reduce-overhead",
+    )
+    parser.add_argument("--hamer-export-vertices", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--hamer-export-mano-params", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--save-hamer-rendered-overlays",
         action=argparse.BooleanOptionalAction,
@@ -100,7 +147,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backup-min-view-quality", type=float, default=0.45)
     parser.add_argument("--backup-max-temporal-error-m", type=float, default=0.06)
     parser.add_argument("--backup-require-known", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--run-mano-local-refine", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--run-zero-shot-palm-fusion", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--zero-shot-primary-output",
+        choices=["raw", "static-calibrated", "smoothed", "causal-smoothed", "adaptive-causal"],
+        default="raw",
+    )
+    parser.add_argument("--zero-shot-bone-calibration-blend", type=float, default=0.0)
+    parser.add_argument("--zero-shot-temporal-radius", type=int, default=0)
+    parser.add_argument("--zero-shot-temporal-sigma", type=float, default=4.0)
+    parser.add_argument("--zero-shot-causal-ema-alpha", type=float, default=0.0)
+    parser.add_argument("--zero-shot-one-euro-min-cutoff", type=float, default=0.2)
+    parser.add_argument("--zero-shot-one-euro-beta", type=float, default=5.0)
+    parser.add_argument("--zero-shot-one-euro-derivative-cutoff", type=float, default=1.0)
+    parser.add_argument("--frame-rate", type=float, help="Override FPS used by causal filters; inferred from frame timestamps by default.")
+    parser.add_argument("--zero-shot-include-vertices", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--run-legacy-local-fusion",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Generate hamer_primary_local output. Not required by the default zero-shot fusion.",
+    )
+    parser.add_argument(
+        "--run-mano-local-refine",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run the legacy MANO local refinement. Disabled by default because zero-shot palm fusion is faster and more accurate here.",
+    )
     parser.add_argument("--run-mano-multiview-image-refine", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--run-mano-image-candidate-selection",
@@ -240,6 +313,7 @@ def run_command(label: str, command: list[str], dry_run: bool, progress_position
     emit(f"[pipeline] run {label}: {' '.join(command)}")
     if dry_run:
         return
+    started = time.perf_counter()
     tty = None
     try:
         tty = open("/dev/tty", "w", encoding="utf-8", buffering=1)
@@ -266,7 +340,7 @@ def run_command(label: str, command: list[str], dry_run: bool, progress_position
             tty.close()
         if returncode != 0:
             raise subprocess.CalledProcessError(returncode, command)
-        emit(f"[pipeline] done {label}")
+        emit(f"[pipeline] done {label} elapsed={time.perf_counter() - started:.3f}s")
         return
     proc = subprocess.Popen(
         command,
@@ -292,7 +366,7 @@ def run_command(label: str, command: list[str], dry_run: bool, progress_position
         unregister_proc(proc)
     if returncode != 0:
         raise subprocess.CalledProcessError(returncode, command)
-    emit(f"[pipeline] done {label}")
+    emit(f"[pipeline] done {label} elapsed={time.perf_counter() - started:.3f}s")
 
 
 def run_parallel_command(label: str, command: list[str], progress_position: int) -> None:
@@ -378,6 +452,27 @@ def group_ids_from_frames(frames_path: Path, cameras: set[str], requested: set[i
     return sorted(ids)
 
 
+def infer_frame_rate(frames_path: Path, camera_id: str) -> float:
+    timestamps: list[tuple[int, int]] = []
+    for record in iter_jsonl(frames_path):
+        if record.get("camera_id") != camera_id or record.get("timestamp_monotonic_ns") is None:
+            continue
+        timestamps.append((int(record["group_id"]), int(record["timestamp_monotonic_ns"])))
+    timestamps.sort()
+    deltas = [
+        (current_time - previous_time) / 1e9
+        for (previous_group, previous_time), (current_group, current_time) in zip(timestamps, timestamps[1:])
+        if current_group == previous_group + 1 and 0 < current_time - previous_time < 1_000_000_000
+    ]
+    return 1.0 / median(deltas) if deltas else 25.0
+
+
+def frames_path_for_base_dir(base_dir: Path) -> Path:
+    dataset_name = base_dir.name.removeprefix("sam3_hamer_")
+    candidate = base_dir.parent / f"cameras_{dataset_name}" / "frames.jsonl"
+    return candidate if candidate.exists() else DEFAULT_FRAMES
+
+
 def chunk_group_ids(group_ids: list[int], chunk_size: int) -> list[list[int]]:
     if chunk_size < 1:
         raise ValueError("--chunk-size must be positive")
@@ -403,14 +498,66 @@ def expanded_chunk_ids(chunk_ids: list[int], selected_group_ids: list[int], over
 
 def main() -> None:
     args = parse_args()
+    if args.hamer_batch_size < 1 or args.hamer_job_batch_size < 1:
+        raise SystemExit("--hamer-batch-size and --hamer-job-batch-size must be positive")
+    profile_defaults = {
+        "quality": ("1.0,1.1,1.2", "mask-adaptive", "float32", "all", "mesh", False),
+        "balanced": ("1.0", "fixed", "float32", "selection-only", "mesh", False),
+        "fast": ("1.0", "fixed", "float16", "selection-only", "mesh", False),
+        "aggressive": ("1.0,1.1,1.2", "mask-adaptive", "float16", "all", "skeleton", True),
+    }
+    (
+        profile_scales,
+        profile_scale_policy,
+        profile_precision,
+        profile_mask_scoring,
+        profile_mask_score_method,
+        profile_compile_backbone,
+    ) = profile_defaults[args.hamer_speed_profile]
+    args.hamer_candidate_bbox_scales = args.hamer_candidate_bbox_scales or profile_scales
+    args.hamer_candidate_scale_policy = args.hamer_candidate_scale_policy or profile_scale_policy
+    args.hamer_precision = args.hamer_precision or profile_precision
+    args.hamer_mask_scoring = args.hamer_mask_scoring or profile_mask_scoring
+    args.hamer_mask_score_method = args.hamer_mask_score_method or profile_mask_score_method
+    if args.hamer_compile_backbone is None:
+        args.hamer_compile_backbone = profile_compile_backbone
+    if not 0.0 <= args.zero_shot_bone_calibration_blend <= 1.0:
+        raise SystemExit("--zero-shot-bone-calibration-blend must be in [0, 1]")
+    if args.zero_shot_temporal_radius < 0:
+        raise SystemExit("--zero-shot-temporal-radius must be non-negative")
+    if args.zero_shot_temporal_radius > 0 and args.zero_shot_temporal_sigma <= 0.0:
+        raise SystemExit("--zero-shot-temporal-sigma must be positive when smoothing is enabled")
+    if not 0.0 <= args.zero_shot_causal_ema_alpha <= 1.0:
+        raise SystemExit("--zero-shot-causal-ema-alpha must be in [0, 1]")
+    if args.zero_shot_one_euro_min_cutoff < 0.0 or args.zero_shot_one_euro_beta < 0.0:
+        raise SystemExit("One Euro cutoff and beta must be non-negative")
+    if args.zero_shot_one_euro_derivative_cutoff <= 0.0:
+        raise SystemExit("One Euro derivative cutoff must be positive")
+    if args.zero_shot_primary_output == "static-calibrated" and args.zero_shot_bone_calibration_blend <= 0.0:
+        raise SystemExit("--zero-shot-primary-output static-calibrated requires a positive bone calibration blend")
+    if args.zero_shot_primary_output == "smoothed" and args.zero_shot_temporal_radius <= 0:
+        raise SystemExit("--zero-shot-primary-output smoothed requires --zero-shot-temporal-radius > 0")
+    if args.zero_shot_primary_output == "causal-smoothed" and args.zero_shot_causal_ema_alpha <= 0.0:
+        raise SystemExit("--zero-shot-primary-output causal-smoothed requires --zero-shot-causal-ema-alpha > 0")
+    if args.zero_shot_primary_output == "adaptive-causal" and args.zero_shot_one_euro_min_cutoff <= 0.0:
+        raise SystemExit("--zero-shot-primary-output adaptive-causal requires --zero-shot-one-euro-min-cutoff > 0")
     if args.range_alias and not args.group_range:
         args.group_range = args.range_alias
     cameras = sorted(parse_cameras(args.cameras))
+    if args.frames is None:
+        args.frames = frames_path_for_base_dir(args.base_dir)
+        emit(f"[pipeline] inferred frames metadata: {args.frames}")
+    if args.frame_rate is None:
+        args.frame_rate = infer_frame_rate(args.frames, cameras[0])
+        emit(f"[pipeline] inferred frame rate: {args.frame_rate:.3f} FPS")
+    if args.frame_rate <= 0.0:
+        raise SystemExit("--frame-rate must be positive")
     camera_set = set(cameras)
     group_ids = parse_group_ids(args.group_range, args.group_ids)
     suffix = range_suffix(group_ids)
     max_workers = max(1, min(2, int(args.max_parallel_workers)))
     max_mediapipe_workers = max(1, min(len(cameras), int(args.max_mediapipe_workers)))
+    max_hamer_workers = max(1, min(len(cameras), int(args.max_hamer_workers)))
     selected_group_ids = group_ids_from_frames(args.frames, camera_set, group_ids)
     chunks = chunk_group_ids(selected_group_ids, args.chunk_size)
     if not selected_group_ids:
@@ -497,6 +644,91 @@ def main() -> None:
     job_shards = []
     hamer_shards = []
 
+    def sam3_command(output_dir: Path, camera_value: str, range_args: list[str]) -> list[str]:
+        command = [
+            *conda_python(args.conda_bin, args.sam3_conda_env),
+            script_path("detect_sam3_hands_multiview.py"),
+            "--frames",
+            str(args.frames),
+            "--rectified-dir",
+            str(args.base_dir / "rectified_for_hamer"),
+            "--output-dir",
+            str(output_dir),
+            "--sam3-root",
+            str(args.sam3_root),
+            "--hf-endpoint",
+            args.sam3_hf_endpoint,
+            "--cameras",
+            camera_value,
+            "--prompt-preset",
+            args.prompt_preset,
+            "--save-mask-debug" if args.save_sam3_debug else "--no-save-mask-debug",
+            "--save-bbox-debug" if args.save_sam3_debug else "--no-save-bbox-debug",
+            *range_args,
+            *overwrite,
+        ]
+        if args.sam3_checkpoint:
+            command.extend(["--checkpoint", str(args.sam3_checkpoint)])
+        if args.sam3_no_hf:
+            command.append("--no-hf")
+        for prompt in args.prompts or []:
+            command.extend(["--prompt", prompt])
+        return command
+
+    def hamer_command(jobs_source: Path, camera_id: str | None, range_args: list[str]) -> list[str]:
+        export_vertices = bool(
+            args.hamer_export_vertices or args.run_mano_local_refine or args.run_mano_multiview_image_refine
+        )
+        export_mano_params = bool(
+            args.hamer_export_mano_params or args.run_mano_local_refine or args.run_mano_multiview_image_refine
+        )
+        command = [
+            *conda_python(args.conda_bin, args.hamer_conda_env),
+            script_path("hamer_multiview_worker.py"),
+            "--jobs",
+            str(jobs_source),
+            "--output-dir",
+            str(args.base_dir / "hamer_per_view"),
+            "--hamer-root",
+            str(args.hamer_root),
+            "--rectified-config",
+            str(rectified_config_path),
+            "--batch-size",
+            str(args.hamer_batch_size),
+            "--job-batch-size",
+            str(args.hamer_job_batch_size),
+            "--candidate-bbox-scales",
+            args.hamer_candidate_bbox_scales,
+            "--candidate-scale-policy",
+            args.hamer_candidate_scale_policy,
+            "--precision",
+            args.hamer_precision,
+            "--mask-scoring",
+            args.hamer_mask_scoring,
+            "--mask-score-method",
+            args.hamer_mask_score_method,
+            "--compile-backbone" if args.hamer_compile_backbone else "--no-compile-backbone",
+            "--compile-mode",
+            args.hamer_compile_mode,
+            "--allow-tf32" if args.hamer_allow_tf32 else "--no-allow-tf32",
+            "--export-vertices" if export_vertices else "--no-export-vertices",
+            "--export-mano-params" if export_mano_params else "--no-export-mano-params",
+            "--save-rendered-overlay" if args.save_hamer_rendered_overlays else "--no-save-rendered-overlay",
+            *range_args,
+            *overwrite,
+        ]
+        if camera_id is not None:
+            camera_insert = command.index("--batch-size")
+            command[camera_insert:camera_insert] = ["--camera-id", camera_id]
+        return command
+
+    if not args.skip_sam3 and args.sam3_execution == "per-sequence":
+        run_command(
+            "sam3:sequence",
+            sam3_command(args.base_dir / "sam3_bboxes", ",".join(cameras), common_range),
+            args.dry_run,
+        )
+
     def heavy_chunk_pipeline(camera_id: str, chunk_ids: list[int], progress_position: int) -> None:
         chunk_suffix, chunk_range = chunk_suffix_and_args(chunk_ids)
         track_ids = expanded_chunk_ids(chunk_ids, selected_group_ids, args.track_overlap if args.hand_track_backend == "sam3-native" else 0)
@@ -505,7 +737,11 @@ def main() -> None:
         sam3_detect_suffix = track_suffix if args.hand_track_backend == "sam3-native" else chunk_suffix
         sam3_detect_range = track_range if args.hand_track_backend == "sam3-native" else chunk_range
         sam3_dir = args.base_dir / "sam3_bboxes" / "chunks" / camera_id / sam3_detect_suffix
-        sam3_shard = sam3_dir / f"sam3_bboxes_{sam3_detect_suffix}.jsonl"
+        sam3_shard = (
+            sam3_output
+            if args.sam3_execution == "per-sequence"
+            else sam3_dir / f"sam3_bboxes_{sam3_detect_suffix}.jsonl"
+        )
         sequence_dir = args.base_dir / "sam3_video_sequences"
         track_dir = args.base_dir / "sam3_tracks" / "chunks" / camera_id / track_suffix
         track_shard = track_dir / f"sam3_tracks_{track_suffix}.jsonl"
@@ -514,33 +750,8 @@ def main() -> None:
         jobs_dir = args.base_dir / "hamer_jobs" / "chunks" / camera_id / chunk_suffix
         jobs_shard = jobs_dir / f"hamer_jobs_{chunk_suffix}.jsonl"
 
-        if not args.skip_sam3:
-            sam3_cmd = [
-                *conda_python(args.conda_bin, args.sam3_conda_env),
-                script_path("detect_sam3_hands_multiview.py"),
-                "--frames",
-                str(args.frames),
-                "--rectified-dir",
-                str(args.base_dir / "rectified_for_hamer"),
-                "--output-dir",
-                str(sam3_dir),
-                "--sam3-root",
-                str(args.sam3_root),
-                "--hf-endpoint",
-                args.sam3_hf_endpoint,
-                "--cameras",
-                camera_id,
-                "--prompt-preset",
-                args.prompt_preset,
-                *sam3_detect_range,
-                *overwrite,
-            ]
-            if args.sam3_checkpoint:
-                sam3_cmd.extend(["--checkpoint", str(args.sam3_checkpoint)])
-            if args.sam3_no_hf:
-                sam3_cmd.append("--no-hf")
-            for prompt in args.prompts or []:
-                sam3_cmd.extend(["--prompt", prompt])
+        if not args.skip_sam3 and args.sam3_execution == "per-chunk":
+            sam3_cmd = sam3_command(sam3_dir, camera_id, sam3_detect_range)
             run_command(f"sam3:{label_suffix}", sam3_cmd, False, progress_position)
 
         tracked_hands_args: list[str] = []
@@ -643,24 +854,8 @@ def main() -> None:
         ]
         run_command(f"fuse_jobs:{label_suffix}", fusion_cmd, False, progress_position)
 
-        if not args.skip_hamer:
-            hamer_cmd = [
-                *conda_python(args.conda_bin, args.hamer_conda_env),
-                script_path("hamer_multiview_worker.py"),
-                "--jobs",
-                str(jobs_shard),
-                "--output-dir",
-                str(args.base_dir / "hamer_per_view"),
-                "--hamer-root",
-                str(args.hamer_root),
-                "--rectified-config",
-                str(rectified_config_path),
-                "--camera-id",
-                camera_id,
-                "--save-rendered-overlay" if args.save_hamer_rendered_overlays else "--no-save-rendered-overlay",
-                *chunk_range,
-                *overwrite,
-            ]
+        if not args.skip_hamer and args.hamer_execution == "per-chunk":
+            hamer_cmd = hamer_command(jobs_shard, camera_id, chunk_range)
             run_command(f"hamer:{label_suffix}", hamer_cmd, False, progress_position)
 
     heavy_tasks: list[tuple[str, str, list[int]]] = []
@@ -669,18 +864,21 @@ def main() -> None:
             chunk_suffix, _chunk_range = chunk_suffix_and_args(chunk_ids)
             sam3_detect_ids = expanded_chunk_ids(chunk_ids, selected_group_ids, args.track_overlap if args.hand_track_backend == "sam3-native" else 0)
             sam3_detect_suffix, _sam3_detect_range = chunk_suffix_and_args(sam3_detect_ids)
-            sam3_shards.append(args.base_dir / "sam3_bboxes" / "chunks" / camera_id / sam3_detect_suffix / f"sam3_bboxes_{sam3_detect_suffix}.jsonl")
+            if args.sam3_execution == "per-chunk":
+                sam3_shards.append(args.base_dir / "sam3_bboxes" / "chunks" / camera_id / sam3_detect_suffix / f"sam3_bboxes_{sam3_detect_suffix}.jsonl")
             if args.hand_track_backend in {"posthoc", "sam3-native"}:
                 track_ids = expanded_chunk_ids(chunk_ids, selected_group_ids, args.track_overlap if args.hand_track_backend == "sam3-native" else 0)
                 track_suffix, _track_range = chunk_suffix_and_args(track_ids)
                 stabilized_track_shards.append(args.base_dir / "sam3_tracks_stabilized" / "chunks" / camera_id / track_suffix / f"sam3_tracks_stabilized_{track_suffix}.jsonl")
             job_shards.append(args.base_dir / "hamer_jobs" / "chunks" / camera_id / chunk_suffix / f"hamer_jobs_{chunk_suffix}.jsonl")
-            hamer_shards.append(args.base_dir / "hamer_per_view" / f"hamer_predictions_{chunk_suffix}_{camera_id}.jsonl")
+            if args.hamer_execution == "per-chunk":
+                hamer_shards.append(args.base_dir / "hamer_per_view" / f"hamer_predictions_{chunk_suffix}_{camera_id}.jsonl")
             heavy_tasks.append((f"heavy:{camera_id}:{chunk_suffix}", camera_id, chunk_ids))
 
     if args.dry_run:
         for label, camera_id, chunk_ids in heavy_tasks:
-            emit(f"[pipeline] parallel {label}: SAM3 -> {args.hand_track_backend} identity -> fuse jobs -> HaMeR for {camera_id} groups={chunk_ids[0]}-{chunk_ids[-1]}")
+            tail = " -> HaMeR" if args.hamer_execution == "per-chunk" and not args.skip_hamer else ""
+            emit(f"[pipeline] parallel {label}: SAM3 -> {args.hand_track_backend} identity -> fuse jobs{tail} for {camera_id} groups={chunk_ids[0]}-{chunk_ids[-1]}")
     else:
         positions: Queue[int] = Queue()
         for position in range(1, max_workers + 1):
@@ -705,22 +903,83 @@ def main() -> None:
                     progress.update(1)
 
     if args.dry_run:
-        emit(f"[pipeline] merge SAM3 shards -> {sam3_output}")
+        if args.sam3_execution == "per-chunk":
+            emit(f"[pipeline] merge SAM3 shards -> {sam3_output}")
         if args.hand_track_backend in {"posthoc", "sam3-native"}:
             emit(f"[pipeline] merge stabilized tracks -> {stabilized_tracks_output}")
         emit(f"[pipeline] merge HaMeR job shards -> {jobs_path}")
-        emit(f"[pipeline] merge HaMeR shards -> {hamer_output}")
     else:
-        sam3_count = merge_jsonl_unique(sam3_shards, sam3_output, "sam3_multiview_bboxes", ("type", "group_id", "camera_id"))
+        sam3_count = None
+        if args.sam3_execution == "per-chunk":
+            sam3_count = merge_jsonl_unique(sam3_shards, sam3_output, "sam3_multiview_bboxes", ("type", "group_id", "camera_id"))
         job_count = merge_jsonl(job_shards, jobs_path, "hamer_multiview_jobs")
-        emit(f"[pipeline] merged SAM3 records: {sam3_count} -> {sam3_output}")
+        if sam3_count is not None:
+            emit(f"[pipeline] merged SAM3 records: {sam3_count} -> {sam3_output}")
         if args.hand_track_backend in {"posthoc", "sam3-native"}:
             track_count = merge_jsonl_unique(stabilized_track_shards, stabilized_tracks_output, "sam3_stabilized_tracks", ("type", "group_id", "camera_id"))
             emit(f"[pipeline] merged stabilized tracks: {track_count} -> {stabilized_tracks_output}")
         emit(f"[pipeline] merged HaMeR jobs: {job_count} -> {jobs_path}")
-        if not args.skip_hamer:
+
+    if not args.skip_hamer and args.hamer_execution == "per-camera":
+        hamer_commands = []
+        for camera_id in cameras:
+            camera_output = args.base_dir / "hamer_per_view" / f"hamer_predictions_{suffix}_{camera_id}.jsonl"
+            hamer_shards.append(camera_output)
+            hamer_commands.append((f"hamer:{camera_id}", hamer_command(jobs_path, camera_id, common_range)))
+        run_parallel(hamer_commands, max_hamer_workers, args.dry_run, desc="HaMeR cameras")
+
+    if not args.skip_hamer and args.hamer_execution == "per-sequence":
+        run_command("hamer:sequence", hamer_command(jobs_path, None, common_range), args.dry_run)
+
+    if not args.skip_hamer and args.hamer_execution != "per-sequence":
+        if args.dry_run:
+            emit(f"[pipeline] merge HaMeR shards -> {hamer_output}")
+        else:
             hamer_count = merge_jsonl(hamer_shards, hamer_output, "hamer_multiview_prediction")
             emit(f"[pipeline] merged HaMeR predictions: {hamer_count} -> {hamer_output}")
+
+    if args.run_zero_shot_palm_fusion:
+        zero_shot_cmd = [
+            sys.executable,
+            "-u",
+            script_path("fuse_hamer_palm_local.py"),
+            "--predictions",
+            str(hamer_output),
+            "--output-dir",
+            str(args.base_dir / "hamer_palm_local_fused"),
+            "--quality-mask-weight",
+            str(args.quality_mask_weight),
+            "--quality-bbox-weight",
+            str(args.quality_bbox_weight),
+            "--quality-edge-weight",
+            str(args.quality_edge_weight),
+            "--quality-source-bonus",
+            str(args.quality_source_bonus),
+            "--quality-known-bonus",
+            str(args.quality_known_bonus),
+            "--bone-calibration-blend",
+            str(args.zero_shot_bone_calibration_blend),
+            "--temporal-radius",
+            str(args.zero_shot_temporal_radius),
+            "--temporal-sigma",
+            str(args.zero_shot_temporal_sigma),
+            "--causal-ema-alpha",
+            str(args.zero_shot_causal_ema_alpha),
+            "--one-euro-min-cutoff",
+            str(args.zero_shot_one_euro_min_cutoff),
+            "--one-euro-beta",
+            str(args.zero_shot_one_euro_beta),
+            "--one-euro-derivative-cutoff",
+            str(args.zero_shot_one_euro_derivative_cutoff),
+            "--frame-rate",
+            str(args.frame_rate),
+            "--primary-output",
+            args.zero_shot_primary_output,
+            "--include-vertices" if args.zero_shot_include_vertices else "--no-include-vertices",
+            *common_range,
+            *overwrite,
+        ]
+        run_command("zero_shot_palm_fusion", zero_shot_cmd, args.dry_run)
 
     local_cmd = [
         sys.executable,
@@ -779,7 +1038,8 @@ def main() -> None:
         *common_range,
         *overwrite,
     ]
-    run_command("local_fusion", local_cmd, args.dry_run)
+    if args.run_legacy_local_fusion or args.run_mano_local_refine:
+        run_command("local_fusion", local_cmd, args.dry_run)
 
     if args.run_mano_local_refine and not args.skip_hamer:
         local_hands_path = args.base_dir / "hamer_primary_local" / f"hamer_local_hands_{suffix}.jsonl"

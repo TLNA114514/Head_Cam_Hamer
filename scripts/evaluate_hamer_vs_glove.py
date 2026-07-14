@@ -32,7 +32,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--glove", type=Path, required=True, help="Camera-synced glove local JSONL.")
     parser.add_argument(
         "--space",
-        choices=["palm-local", "root-relative", "glove-calibrated-palm-local", "glove-calibrated-root-relative"],
+        choices=[
+            "palm-local",
+            "raw-palm-local",
+            "zero-shot-static-palm-local",
+            "smoothed-palm-local",
+            "causal-smoothed-palm-local",
+            "adaptive-causal-palm-local",
+            "root-relative",
+            "glove-calibrated-palm-local",
+            "glove-calibrated-root-relative",
+        ],
         default="palm-local",
     )
     parser.add_argument("--hands", default="Left,Right")
@@ -92,10 +102,25 @@ def finite_xyz(value: Any) -> bool:
     )
 
 
-def hand_positions(hand: dict[str, Any], space: str) -> np.ndarray | None:
+def hand_positions(hand: dict[str, Any], space: str, allow_specialized_fallback: bool = False) -> np.ndarray | None:
     if space == "palm-local":
         direct_keys = ["palm_local_joints_m"]
         joint_keys = ["palm_local_m"]
+    elif space == "raw-palm-local":
+        direct_keys = ["raw_palm_local_joints_m"]
+        joint_keys = ["raw_palm_local_m"]
+    elif space == "zero-shot-static-palm-local":
+        direct_keys = ["static_calibrated_palm_local_joints_m"]
+        joint_keys = ["static_calibrated_palm_local_m"]
+    elif space == "smoothed-palm-local":
+        direct_keys = ["smoothed_palm_local_joints_m"]
+        joint_keys = ["smoothed_palm_local_m"]
+    elif space == "causal-smoothed-palm-local":
+        direct_keys = ["causal_smoothed_palm_local_joints_m"]
+        joint_keys = ["causal_smoothed_palm_local_m"]
+    elif space == "adaptive-causal-palm-local":
+        direct_keys = ["adaptive_causal_palm_local_joints_m"]
+        joint_keys = ["adaptive_causal_palm_local_m"]
     elif space == "root-relative":
         direct_keys = ["local_joints_m"]
         joint_keys = ["root_relative_headset_m"]
@@ -107,6 +132,16 @@ def hand_positions(hand: dict[str, Any], space: str) -> np.ndarray | None:
         joint_keys = ["glove_calibrated_root_relative_m", "root_relative_headset_m"]
     else:
         raise ValueError(f"Unsupported space: {space}")
+
+    if allow_specialized_fallback and space in {
+        "raw-palm-local",
+        "zero-shot-static-palm-local",
+        "smoothed-palm-local",
+        "causal-smoothed-palm-local",
+        "adaptive-causal-palm-local",
+    }:
+        direct_keys.append("palm_local_joints_m")
+        joint_keys.append("palm_local_m")
 
     for direct_key in direct_keys:
         direct = hand.get(direct_key)
@@ -132,7 +167,12 @@ def hand_positions(hand: dict[str, Any], space: str) -> np.ndarray | None:
     return None
 
 
-def load_hands_by_group(path: Path, space: str, group_filter: set[int] | None) -> dict[int, dict[str, dict[str, Any]]]:
+def load_hands_by_group(
+    path: Path,
+    space: str,
+    group_filter: set[int] | None,
+    allow_specialized_fallback: bool = False,
+) -> dict[int, dict[str, dict[str, Any]]]:
     frames: dict[int, dict[str, dict[str, Any]]] = {}
     with path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -149,7 +189,7 @@ def load_hands_by_group(path: Path, space: str, group_filter: set[int] | None) -
                 handedness = hand.get("handedness")
                 if handedness not in {"Left", "Right"}:
                     continue
-                positions = hand_positions(hand, space)
+                positions = hand_positions(hand, space, allow_specialized_fallback)
                 if positions is None:
                     continue
                 item = dict(hand)
@@ -312,7 +352,7 @@ def main() -> None:
     fingers = parse_fingers(args.fingers)
     target_joints = [(finger, index) for finger in fingers for index in FINGER_JOINTS[finger]]
 
-    glove_frames = load_hands_by_group(args.glove, args.space, group_filter)
+    glove_frames = load_hands_by_group(args.glove, args.space, group_filter, allow_specialized_fallback=True)
     summary, rows = evaluate_one(
         args.hamer,
         glove_frames,

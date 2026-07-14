@@ -8,7 +8,9 @@ import builtins
 import json
 import os
 import sys
+import time
 import warnings
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +18,7 @@ import cv2
 import numpy as np
 import torch
 
-from hamer_multiview_utils import DEFAULT_BASE_DIR, iter_jsonl, load_mask, parse_group_ids, range_suffix
+from hamer_multiview_utils import HAND_CONNECTIONS, DEFAULT_BASE_DIR, iter_jsonl, load_mask, parse_group_ids, range_suffix
 from progress_utils import tqdm
 
 
@@ -49,8 +51,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--group-ids")
     parser.add_argument("--camera-id", help="Optional single camera shard.")
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--job-batch-size", type=int, default=8, help="Number of jobs to preprocess and pack together.")
     parser.add_argument("--rescale-factor", type=float, default=2.0)
     parser.add_argument("--candidate-bbox-scales", default="1.0,1.1,1.2")
+    parser.add_argument(
+        "--candidate-scale-policy",
+        choices=["fixed", "mask-adaptive"],
+        default="fixed",
+        help="Use all configured scales, or collapse to the scale nearest 1.0 when no readable SAM3 mask exists.",
+    )
+    parser.add_argument("--precision", choices=["float32", "float16", "bfloat16"], default="float32")
+    parser.add_argument("--allow-tf32", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--mask-scoring",
+        choices=["all", "selection-only", "none"],
+        default="all",
+        help="Render candidate masks always, only when selection is ambiguous, or never.",
+    )
+    parser.add_argument(
+        "--mask-score-method",
+        choices=["mesh", "skeleton"],
+        default="mesh",
+        help="Score SAM3 overlap with a rendered mesh or a lightweight projected skeleton proxy.",
+    )
+    parser.add_argument("--compile-backbone", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--compile-mode",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        default="reduce-overhead",
+    )
+    parser.add_argument(
+        "--export-vertices",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write 778 MANO vertices per prediction. Disable for joint-only fusion to reduce JSONL I/O.",
+    )
+    parser.add_argument(
+        "--export-mano-params",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write MANO rotation matrices and betas. Joint-only fusion does not require them.",
+    )
     parser.add_argument("--save-rendered-overlay", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--include-debug-only", action="store_true")
     parser.add_argument("--progress-every", type=int, default=10, help="Print line-based progress every N jobs; 0 disables.")
@@ -204,12 +245,11 @@ def keypoints_2d_to_full_image(
 def joint_confidences(
     points: np.ndarray,
     bbox: list[float] | np.ndarray,
-    mask_path: str | None,
+    mask: np.ndarray | None,
     mask_score: float | None,
     image_shape: tuple[int, int, int],
 ) -> list[float]:
     img_h, img_w = image_shape[:2]
-    mask = load_mask(mask_path, image_size=(img_w, img_h))
     bbox_score = bbox_area_score(bbox, image_shape)
     edge_score = bbox_edge_score(bbox, image_shape)
     mask_component = float(np.clip(mask_score if mask_score is not None else 0.35, 0.0, 1.0))
@@ -231,14 +271,27 @@ def joint_confidences(
     return confidences
 
 
-def score_candidates_with_mask(
+def set_mask_overlap_score(candidate: dict[str, Any], reference_mask: np.ndarray, candidate_mask: np.ndarray) -> None:
+    inter = float(np.logical_and(reference_mask, candidate_mask).sum())
+    union = float(np.logical_or(reference_mask, candidate_mask).sum())
+    sam_area = float(reference_mask.sum())
+    candidate_area = float(candidate_mask.sum())
+    iou = inter / union if union > 0 else 0.0
+    sam_cov = inter / sam_area if sam_area > 0 else 0.0
+    candidate_cov = inter / candidate_area if candidate_area > 0 else 0.0
+    candidate["mask_iou"] = iou
+    candidate["mask_sam_coverage"] = sam_cov
+    candidate["mask_mesh_coverage"] = candidate_cov
+    candidate["mask_score"] = 0.45 * iou + 0.45 * sam_cov + 0.10 * candidate_cov
+
+
+def score_candidates_with_mesh_mask(
     candidates: list[dict[str, Any]],
-    mask_path: str | None,
+    mask: np.ndarray | None,
     renderer: Any,
     image_shape: tuple[int, int, int],
     focal_length: Any,
 ) -> None:
-    mask = load_mask(mask_path)
     if mask is None:
         return
     for candidate in candidates:
@@ -253,17 +306,42 @@ def score_candidates_with_mask(
         except Exception:
             continue
         mesh_mask = rgba[:, :, 3] > 0.05
-        inter = float(np.logical_and(mask, mesh_mask).sum())
-        union = float(np.logical_or(mask, mesh_mask).sum())
-        sam_area = float(mask.sum())
-        mesh_area = float(mesh_mask.sum())
-        iou = inter / union if union > 0 else 0.0
-        sam_cov = inter / sam_area if sam_area > 0 else 0.0
-        mesh_cov = inter / mesh_area if mesh_area > 0 else 0.0
-        candidate["mask_iou"] = iou
-        candidate["mask_sam_coverage"] = sam_cov
-        candidate["mask_mesh_coverage"] = mesh_cov
-        candidate["mask_score"] = 0.45 * iou + 0.45 * sam_cov + 0.10 * mesh_cov
+        set_mask_overlap_score(candidate, mask, mesh_mask)
+
+
+def score_candidates_with_skeleton_mask(
+    candidates: list[dict[str, Any]],
+    mask: np.ndarray | None,
+    image_shape: tuple[int, int, int],
+) -> None:
+    if mask is None:
+        return
+    image_height, image_width = image_shape[:2]
+    palm_indices = np.asarray([0, 5, 9, 13, 17], dtype=np.int32)
+    for candidate in candidates:
+        points = np.asarray(candidate.get("keypoints_2d"), dtype=np.float32)[:21]
+        if points.shape != (21, 2) or not np.isfinite(points).all():
+            continue
+        points[:, 0] = np.clip(points[:, 0], 0, image_width - 1)
+        points[:, 1] = np.clip(points[:, 1], 0, image_height - 1)
+        points_i = np.rint(points).astype(np.int32)
+        thickness = max(3, int(round(float(candidate.get("bbox_size", 100.0)) * 0.035)))
+        skeleton_mask = np.zeros((image_height, image_width), dtype=np.uint8)
+        palm = cv2.convexHull(points_i[palm_indices])
+        cv2.fillConvexPoly(skeleton_mask, palm, 1)
+        for start, end in HAND_CONNECTIONS:
+            cv2.line(
+                skeleton_mask,
+                tuple(points_i[start]),
+                tuple(points_i[end]),
+                1,
+                thickness=thickness,
+                lineType=cv2.LINE_AA,
+            )
+        joint_radius = max(2, thickness // 2)
+        for point in points_i:
+            cv2.circle(skeleton_mask, tuple(point), joint_radius, 1, thickness=-1, lineType=cv2.LINE_AA)
+        set_mask_overlap_score(candidate, mask, skeleton_mask.astype(bool))
 
 
 def detach_mano_params(pred: dict[str, Any], index: int) -> dict[str, Any]:
@@ -280,6 +358,8 @@ def detach_mano_params(pred: dict[str, Any], index: int) -> dict[str, Any]:
 def main() -> None:
     install_noise_filters()
     args = parse_args()
+    if args.batch_size < 1 or args.job_batch_size < 1:
+        raise SystemExit("--batch-size and --job-batch-size must be positive")
     original_cwd = Path.cwd()
     group_ids = parse_group_ids(args.group_range, args.group_ids)
     suffix = range_suffix(group_ids)
@@ -319,167 +399,308 @@ def main() -> None:
     if not model_config_path.exists():
         raise SystemExit(f"HaMeR model_config.yaml not found next to checkpoint: {model_config_path}")
     print(f"[HaMeR {args.camera_id or 'all'}] loading model checkpoint={checkpoint_path}", flush=True)
+    load_started = time.perf_counter()
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     os.chdir(args.hamer_root)
     try:
-        model, model_cfg = load_hamer(str(checkpoint_path))
+        model, model_cfg = load_hamer(str(checkpoint_path), map_location=device)
     finally:
         os.chdir(original_cwd)
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     model = model.to(device).eval()
-    renderer = Renderer(model_cfg, faces=model.mano.faces)
+    eager_backbone = model.backbone
+    compile_requested = bool(args.compile_backbone)
+    compile_enabled = False
+    compile_error = None
+    if compile_requested:
+        try:
+            if device.type != "cuda":
+                raise RuntimeError("backbone compile is enabled only on CUDA")
+            if not hasattr(torch, "compile"):
+                raise RuntimeError("torch.compile is unavailable")
+            model.backbone = torch.compile(eager_backbone, mode=args.compile_mode)
+            compile_enabled = True
+        except Exception as exc:
+            compile_error = f"{type(exc).__name__}: {exc}"
+            print(f"[HaMeR] backbone compile disabled: {compile_error}", flush=True)
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = bool(args.allow_tf32)
+        torch.backends.cudnn.allow_tf32 = bool(args.allow_tf32)
+    renderer_required = bool(
+        args.save_rendered_overlay
+        or (args.mask_scoring != "none" and args.mask_score_method == "mesh")
+    )
+    renderer = Renderer(model_cfg, faces=model.mano.faces) if renderer_required else None
+    model_load_seconds = time.perf_counter() - load_started
     scales = parse_float_list(args.candidate_bbox_scales)
     jobs = iter_jobs(jobs_path, args.camera_id, args.include_debug_only, group_ids)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     render_dir = args.output_dir / "rendered"
-    stats = {"jobs": len(jobs), "predictions": 0, "failed_jobs": 0, "unknown_jobs": 0}
+    stats = {
+        "jobs": len(jobs),
+        "predictions": 0,
+        "failed_jobs": 0,
+        "unknown_jobs": 0,
+        "mask_adaptive_jobs": 0,
+        "mask_adaptive_candidates_avoided": 0,
+        "image_reads": 0,
+        "image_cache_hits": 0,
+        "candidate_samples": 0,
+        "model_forward_batches": 0,
+    }
+    timing = {
+        "model_load_seconds": model_load_seconds,
+        "image_and_dataset_setup_seconds": 0.0,
+        "model_and_output_seconds": 0.0,
+        "mask_scoring_seconds": 0.0,
+        "overlay_seconds": 0.0,
+        "serialize_seconds": 0.0,
+    }
+    autocast_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}.get(args.precision)
+    need_candidate_vertices = bool(
+        args.export_vertices
+        or args.save_rendered_overlay
+        or (args.mask_scoring != "none" and args.mask_score_method == "mesh")
+    )
+    inference_started = time.perf_counter()
 
     print(f"[HaMeR {args.camera_id or 'all'}] start jobs={len(jobs)} output={output_path}", flush=True)
     with output_path.open("w", encoding="utf-8") as out:
-        progress = tqdm(jobs, desc=f"HaMeR {args.camera_id or 'all'}", unit="job", position=args.progress_position)
-        for index, job in enumerate(progress, start=1):
-            frame_path = Path(job["hamer_frame_path"])
-            img_cv2 = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
-            if img_cv2 is None:
-                stats["failed_jobs"] += 1
-                continue
-            records = candidate_records(job, img_cv2.shape, scales)
-            if job.get("handedness") == "unknown":
-                stats["unknown_jobs"] += 1
-            boxes = np.stack([item["bbox"] for item in records])
-            right = np.asarray([item["is_right"] for item in records], dtype=np.int64)
-            dataset = ViTDetDataset(model_cfg, img_cv2, boxes, right, rescale_factor=args.rescale_factor)
-            dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
-            candidates = []
+        progress = tqdm(total=len(jobs), desc=f"HaMeR {args.camera_id or 'all'}", unit="job", position=args.progress_position)
+        for job_start in range(0, len(jobs), args.job_batch_size):
+            contexts: list[dict[str, Any]] = []
+            samples: list[dict[str, Any]] = []
+            sample_refs: list[tuple[int, dict[str, Any]]] = []
+            image_cache: dict[Path, np.ndarray] = {}
+            for job_offset, job in enumerate(jobs[job_start : job_start + args.job_batch_size]):
+                index = job_start + job_offset + 1
+                preprocess_started = time.perf_counter()
+                frame_path = Path(job["hamer_frame_path"])
+                img_cv2 = image_cache.get(frame_path)
+                if img_cv2 is None:
+                    img_cv2 = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+                    stats["image_reads"] += 1
+                    if img_cv2 is not None:
+                        image_cache[frame_path] = img_cv2
+                else:
+                    stats["image_cache_hits"] += 1
+                if img_cv2 is None:
+                    stats["failed_jobs"] += 1
+                    progress.update(1)
+                    continue
+                sam_mask = load_mask(
+                    job.get("sam3_mask_path"),
+                    image_size=(img_cv2.shape[1], img_cv2.shape[0]),
+                )
+                job_scales = scales
+                scale_scoring_available = sam_mask is not None and args.mask_scoring != "none"
+                if args.candidate_scale_policy == "mask-adaptive" and not scale_scoring_available and len(scales) > 1:
+                    job_scales = [min(scales, key=lambda scale: abs(float(scale) - 1.0))]
+                    side_count = 1 if job.get("handedness") in {"Left", "Right"} else 2
+                    stats["mask_adaptive_jobs"] += 1
+                    stats["mask_adaptive_candidates_avoided"] += side_count * (len(scales) - len(job_scales))
+                records = candidate_records(job, img_cv2.shape, job_scales)
+                stats["candidate_samples"] += len(records)
+                if job.get("handedness") == "unknown":
+                    stats["unknown_jobs"] += 1
+                boxes = np.stack([item["bbox"] for item in records])
+                right = np.asarray([item["is_right"] for item in records], dtype=np.int64)
+                dataset = ViTDetDataset(model_cfg, img_cv2, boxes, right, rescale_factor=args.rescale_factor)
+                context_index = len(contexts)
+                contexts.append(
+                    {"index": index, "job": job, "image": img_cv2, "sam_mask": sam_mask, "candidates": []}
+                )
+                for record_index, record in enumerate(records):
+                    samples.append(dataset[record_index])
+                    sample_refs.append((context_index, record))
+                timing["image_and_dataset_setup_seconds"] += time.perf_counter() - preprocess_started
+
+            dataloader = torch.utils.data.DataLoader(samples, batch_size=args.batch_size, shuffle=False, num_workers=0)
             record_offset = 0
-            last_scaled_focal_length = None
             for batch in dataloader:
+                stats["model_forward_batches"] += 1
                 batch = recursive_to(batch, device)
-                with torch.no_grad():
-                    pred = model(batch)
+                forward_started = time.perf_counter()
+                autocast_context = (
+                    torch.autocast(device_type="cuda", dtype=autocast_dtype)
+                    if device.type == "cuda" and autocast_dtype is not None
+                    else nullcontext()
+                )
+                with torch.inference_mode(), autocast_context:
+                    try:
+                        pred = model(batch)
+                    except Exception as exc:
+                        if not compile_enabled:
+                            raise
+                        compile_error = f"runtime {type(exc).__name__}: {exc}"
+                        print(f"[HaMeR] compiled backbone failed; retrying eager: {compile_error}", flush=True)
+                        model.backbone = eager_backbone
+                        compile_enabled = False
+                        pred = model(batch)
                 multiplier = 2 * batch["right"] - 1
-                pred_cam = pred["pred_cam"]
-                pred_cam[:, 1] = multiplier * pred_cam[:, 1]
+                raw_pred_cam = pred["pred_cam"]
+                pred_cam = torch.stack(
+                    [raw_pred_cam[:, 0], multiplier * raw_pred_cam[:, 1], raw_pred_cam[:, 2]], dim=-1
+                )
                 box_center = batch["box_center"].float()
                 box_size = batch["box_size"].float()
                 img_size = batch["img_size"].float()
-                scaled_focal_length = model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * img_size.max()
-                pred_cam_t_full = cam_crop_to_full(pred_cam, box_center, box_size, img_size, scaled_focal_length).detach().cpu().numpy()
-                last_scaled_focal_length = scaled_focal_length
+                scaled_focal_lengths = (
+                    model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * img_size.max(dim=1).values
+                )
+                pred_cam_t_full = cam_crop_to_full(
+                    pred_cam, box_center, box_size, img_size, scaled_focal_lengths
+                ).detach().cpu().numpy()
 
-                batch_size = batch["img"].shape[0]
-                for n in range(batch_size):
-                    rec = records[record_offset + n]
-                    is_right = int(batch["right"][n].detach().cpu().item())
-                    verts = pred["pred_vertices"][n].detach().cpu().numpy()
-                    joints = pred["pred_keypoints_3d"][n].detach().cpu().numpy()
+                current_batch_size = batch["img"].shape[0]
+                for sample_index in range(current_batch_size):
+                    context_index, record = sample_refs[record_offset + sample_index]
+                    is_right = int(batch["right"][sample_index].detach().cpu().item())
+                    verts = (
+                        pred["pred_vertices"][sample_index].detach().cpu().numpy()
+                        if need_candidate_vertices
+                        else None
+                    )
+                    joints = pred["pred_keypoints_3d"][sample_index].detach().cpu().numpy()
                     keypoints_2d = keypoints_2d_to_full_image(
-                        pred["pred_keypoints_2d"][n],
-                        box_center[n],
-                        box_size[n],
+                        pred["pred_keypoints_2d"][sample_index],
+                        box_center[sample_index],
+                        box_size[sample_index],
                         is_right,
                     )
-                    verts[:, 0] = (2 * is_right - 1) * verts[:, 0]
+                    if verts is not None:
+                        verts[:, 0] = (2 * is_right - 1) * verts[:, 0]
                     joints[:, 0] = (2 * is_right - 1) * joints[:, 0]
-                    candidates.append(
+                    contexts[context_index]["candidates"].append(
                         {
-                            "handedness": rec["handedness"],
+                            "handedness": record["handedness"],
                             "is_right": is_right,
-                            "hypothesis_status": rec["hypothesis_status"],
-                            "bbox": rec["bbox"],
-                            "bbox_scale": rec["bbox_scale"],
+                            "hypothesis_status": record["hypothesis_status"],
+                            "bbox": record["bbox"],
+                            "bbox_scale": record["bbox_scale"],
                             "verts": verts,
                             "joints": joints,
-                            "raw_verts": pred["pred_vertices"][n].detach().cpu().numpy(),
-                            "cam_t": pred_cam_t_full[n],
-                            "pred_cam_t": pred["pred_cam_t"][n].detach().cpu().numpy(),
+                            "cam_t": pred_cam_t_full[sample_index],
+                            "pred_cam_t": pred["pred_cam_t"][sample_index].detach().cpu().numpy(),
                             "keypoints_2d": keypoints_2d,
-                            "bbox_center": box_center[n].detach().cpu().numpy(),
-                            "bbox_size": float(box_size[n].detach().cpu().item()),
-                            "mano_params_rotmat": detach_mano_params(pred, n),
-                            "batch_img": batch["img"][n].detach().cpu(),
+                            "bbox_center": box_center[sample_index].detach().cpu().numpy(),
+                            "bbox_size": float(box_size[sample_index].detach().cpu().item()),
+                            "scaled_focal_length": float(scaled_focal_lengths[sample_index].detach().cpu().item()),
+                            "mano_params_rotmat": (
+                                detach_mano_params(pred, sample_index) if args.export_mano_params else None
+                            ),
                             "mask_score": None,
                         }
                     )
-                record_offset += batch_size
+                timing["model_and_output_seconds"] += time.perf_counter() - forward_started
+                record_offset += current_batch_size
 
-            score_candidates_with_mask(
-                candidates,
-                job.get("sam3_mask_path"),
-                renderer,
-                img_cv2.shape,
-                last_scaled_focal_length,
-            )
-            selected = choose_candidate(candidates)
-            if selected is None:
-                stats["failed_jobs"] += 1
-                continue
+            for context in contexts:
+                index = int(context["index"])
+                job = context["job"]
+                img_cv2 = context["image"]
+                candidates = context["candidates"]
+                mask_started = time.perf_counter()
+                should_score_mask = args.mask_scoring == "all" or (
+                    args.mask_scoring == "selection-only" and len(candidates) > 1
+                )
+                if should_score_mask:
+                    if args.mask_score_method == "mesh":
+                        score_candidates_with_mesh_mask(
+                            candidates,
+                            context["sam_mask"],
+                            renderer,
+                            img_cv2.shape,
+                            candidates[0]["scaled_focal_length"] if candidates else None,
+                        )
+                    else:
+                        score_candidates_with_skeleton_mask(candidates, context["sam_mask"], img_cv2.shape)
+                timing["mask_scoring_seconds"] += time.perf_counter() - mask_started
+                selected = choose_candidate(candidates)
+                if selected is None:
+                    stats["failed_jobs"] += 1
+                    progress.update(1)
+                    continue
 
-            render_path = None
-            if args.save_rendered_overlay:
-                try:
-                    rgba = renderer.render_rgba_multiple(
-                        [selected["verts"]],
-                        cam_t=[selected["cam_t"]],
-                        render_res=[img_cv2.shape[1], img_cv2.shape[0]],
-                        is_right=[selected["is_right"]],
-                        focal_length=last_scaled_focal_length,
-                    )
-                    input_img = img_cv2.astype(np.float32)[:, :, ::-1] / 255.0
-                    input_img = np.concatenate([input_img, np.ones_like(input_img[:, :, :1])], axis=2)
-                    overlay = input_img[:, :, :3] * (1 - rgba[:, :, 3:]) + rgba[:, :, :3] * rgba[:, :, 3:]
-                    render_path = render_dir / str(job["camera_id"]) / f"{int(job['group_id']):08d}_{int(job['job_index']):02d}.jpg"
-                    render_path.parent.mkdir(parents=True, exist_ok=True)
-                    cv2.imwrite(str(render_path), 255 * overlay[:, :, ::-1])
-                except Exception as exc:
-                    print(f"render failed for job {job.get('group_id')} {job.get('camera_id')}: {exc}", flush=True)
+                render_path = None
+                if args.save_rendered_overlay:
+                    overlay_started = time.perf_counter()
+                    try:
+                        rgba = renderer.render_rgba_multiple(
+                            [selected["verts"]],
+                            cam_t=[selected["cam_t"]],
+                            render_res=[img_cv2.shape[1], img_cv2.shape[0]],
+                            is_right=[selected["is_right"]],
+                            focal_length=selected["scaled_focal_length"],
+                        )
+                        input_img = img_cv2.astype(np.float32)[:, :, ::-1] / 255.0
+                        input_img = np.concatenate([input_img, np.ones_like(input_img[:, :, :1])], axis=2)
+                        overlay = input_img[:, :, :3] * (1 - rgba[:, :, 3:]) + rgba[:, :, :3] * rgba[:, :, 3:]
+                        render_path = render_dir / str(job["camera_id"]) / f"{int(job['group_id']):08d}_{int(job['job_index']):02d}.jpg"
+                        render_path.parent.mkdir(parents=True, exist_ok=True)
+                        cv2.imwrite(str(render_path), 255 * overlay[:, :, ::-1])
+                    except Exception as exc:
+                        print(f"render failed for job {job.get('group_id')} {job.get('camera_id')}: {exc}", flush=True)
+                    timing["overlay_seconds"] += time.perf_counter() - overlay_started
 
-            prediction = {
-                "type": "hamer_multiview_prediction",
-                "group_id": int(job["group_id"]),
-                "camera_id": job["camera_id"],
-                "job_index": int(job["job_index"]),
-                "handedness": selected["handedness"],
-                "handedness_source": job.get("handedness_source"),
-                "is_right": int(selected["is_right"]),
-                "bbox_rectified_px": job["bbox_rectified_px"],
-                "source_detector": job.get("source_detector"),
-                "rectified_image_path": job.get("rectified_image_path"),
-                "hamer_frame_path": job.get("hamer_frame_path"),
-                "used_mask_blur": bool(job.get("used_mask_blur")),
-                "sam3_mask_path": job.get("sam3_mask_path"),
-                "track_id": job.get("track_id"),
-                "locked_handedness": job.get("locked_handedness"),
-                "handedness_confidence": job.get("handedness_confidence"),
-                "hamer_joints_cam": selected["joints"].tolist(),
-                "hamer_vertices_cam": selected["verts"].tolist(),
-                "hamer_joints_2d_rectified_px": selected["keypoints_2d"][:21].tolist(),
-                "hamer_joints_2d_conf": joint_confidences(
-                    selected["keypoints_2d"],
-                    selected.get("bbox", job["bbox_rectified_px"]),
-                    job.get("sam3_mask_path"),
-                    selected.get("mask_score"),
-                    img_cv2.shape,
-                ),
-                "hamer_cam_t": selected["cam_t"].tolist(),
-                "hamer_pred_cam_t": selected["pred_cam_t"].tolist(),
-                "hamer_focal_length": float(last_scaled_focal_length.detach().cpu().item()) if torch.is_tensor(last_scaled_focal_length) else float(last_scaled_focal_length),
-                "hamer_bbox_center": selected["bbox_center"].tolist(),
-                "hamer_bbox_size": float(selected["bbox_size"]),
-                "mano_params_rotmat": selected.get("mano_params_rotmat"),
-                "mano_param_source": "hamer" if selected.get("mano_params_rotmat") else None,
-                "bbox_scale": float(selected["bbox_scale"]),
-                "rectified_K": rectified_intrinsics.get(str(job["camera_id"])),
-                "rectified_K_source": rectified_intrinsics_source,
-                "mask_score": selected.get("mask_score"),
-                "mask_iou": selected.get("mask_iou"),
-                "rendered_overlay_path": str(render_path) if render_path else None,
-                "hypothesis_status": selected["hypothesis_status"],
-            }
-            out.write(json.dumps(prediction, ensure_ascii=False, separators=(",", ":")) + "\n")
-            stats["predictions"] += 1
-            if args.progress_every > 0 and (index % args.progress_every == 0 or index == len(jobs)):
-                progress.set_postfix_str(f"group={job['group_id']} pred={stats['predictions']} failed={stats['failed_jobs']}")
+                prediction = {
+                    "type": "hamer_multiview_prediction",
+                    "group_id": int(job["group_id"]),
+                    "camera_id": job["camera_id"],
+                    "job_index": int(job["job_index"]),
+                    "handedness": selected["handedness"],
+                    "handedness_source": job.get("handedness_source"),
+                    "is_right": int(selected["is_right"]),
+                    "bbox_rectified_px": job["bbox_rectified_px"],
+                    "source_detector": job.get("source_detector"),
+                    "rectified_image_path": job.get("rectified_image_path"),
+                    "hamer_frame_path": job.get("hamer_frame_path"),
+                    "used_mask_blur": bool(job.get("used_mask_blur")),
+                    "sam3_mask_path": job.get("sam3_mask_path"),
+                    "sam3_score": job.get("sam3_score"),
+                    "track_id": job.get("track_id"),
+                    "locked_handedness": job.get("locked_handedness"),
+                    "handedness_confidence": job.get("handedness_confidence"),
+                    "hamer_joints_cam": selected["joints"].tolist(),
+                    "hamer_vertices_cam": selected["verts"].tolist() if args.export_vertices else None,
+                    "hamer_joints_2d_rectified_px": selected["keypoints_2d"][:21].tolist(),
+                    "hamer_joints_2d_conf": joint_confidences(
+                        selected["keypoints_2d"],
+                        selected.get("bbox", job["bbox_rectified_px"]),
+                        context["sam_mask"],
+                        selected.get("mask_score"),
+                        img_cv2.shape,
+                    ),
+                    "hamer_cam_t": selected["cam_t"].tolist(),
+                    "hamer_pred_cam_t": selected["pred_cam_t"].tolist(),
+                    "hamer_focal_length": selected["scaled_focal_length"],
+                    "hamer_bbox_center": selected["bbox_center"].tolist(),
+                    "hamer_bbox_size": float(selected["bbox_size"]),
+                    "mano_params_rotmat": selected.get("mano_params_rotmat"),
+                    "mano_param_source": "hamer" if selected.get("mano_params_rotmat") else None,
+                    "bbox_scale": float(selected["bbox_scale"]),
+                    "rectified_K": rectified_intrinsics.get(str(job["camera_id"])),
+                    "rectified_K_source": rectified_intrinsics_source,
+                    "mask_score": selected.get("mask_score"),
+                    "mask_iou": selected.get("mask_iou"),
+                    "candidate_mask_scoring": args.mask_scoring,
+                    "candidate_mask_score_method": args.mask_score_method,
+                    "candidate_scale_policy": args.candidate_scale_policy,
+                    "rendered_overlay_path": str(render_path) if render_path else None,
+                    "hypothesis_status": selected["hypothesis_status"],
+                }
+                serialize_started = time.perf_counter()
+                out.write(json.dumps(prediction, ensure_ascii=False, separators=(",", ":")) + "\n")
+                timing["serialize_seconds"] += time.perf_counter() - serialize_started
+                stats["predictions"] += 1
+                progress.update(1)
+                if args.progress_every > 0 and (index % args.progress_every == 0 or index == len(jobs)):
+                    progress.set_postfix_str(f"group={job['group_id']} pred={stats['predictions']} failed={stats['failed_jobs']}")
+        progress.close()
 
+    inference_seconds = time.perf_counter() - inference_started
+    timing["inference_total_seconds"] = inference_seconds
+    timing["jobs_per_second"] = len(jobs) / inference_seconds if inference_seconds > 0.0 else None
+    timing["predictions_per_second"] = stats["predictions"] / inference_seconds if inference_seconds > 0.0 else None
     with (args.output_dir / f"hamer_predictions_config_{suffix}{camera_suffix}.json").open("w", encoding="utf-8") as f:
         json.dump(
             {
@@ -488,6 +709,24 @@ def main() -> None:
                 "hamer_root": str(args.hamer_root),
                 "checkpoint": str(checkpoint_path),
                 "candidate_bbox_scales": scales,
+                "candidate_scale_policy": args.candidate_scale_policy,
+                "batch_size": args.batch_size,
+                "job_batch_size": args.job_batch_size,
+                "precision": args.precision,
+                "effective_precision": args.precision if device.type == "cuda" else "float32",
+                "allow_tf32": args.allow_tf32,
+                "mask_scoring": args.mask_scoring,
+                "mask_score_method": args.mask_score_method,
+                "compile_backbone_requested": compile_requested,
+                "compile_backbone_enabled": compile_enabled,
+                "compile_mode": args.compile_mode,
+                "compile_error": compile_error,
+                "export_vertices": args.export_vertices,
+                "export_mano_params": args.export_mano_params,
+                "candidate_vertices_materialized": need_candidate_vertices,
+                "save_rendered_overlay": args.save_rendered_overlay,
+                "renderer_initialized": renderer_required,
+                "timing": timing,
                 "stats": stats,
             },
             f,
@@ -498,6 +737,9 @@ def main() -> None:
     print("Summary")
     for key, value in stats.items():
         print(f"  {key}: {value}")
+    print(f"  model_load_seconds: {timing['model_load_seconds']:.3f}")
+    print(f"  inference_total_seconds: {timing['inference_total_seconds']:.3f}")
+    print(f"  jobs_per_second: {timing['jobs_per_second']:.3f}")
     print(f"wrote: {output_path}")
 
 

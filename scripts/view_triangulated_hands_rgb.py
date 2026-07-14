@@ -186,7 +186,8 @@ def normalize_hamer_local_frame(record: dict[str, Any]) -> dict[str, Any]:
     hands = []
     for hand in record.get("hands", []):
         joints = []
-        for index, position in enumerate(hand.get("local_joints_m") or []):
+        local_values = hand.get("local_joints_m") or hand.get("palm_local_joints_m") or []
+        for index, position in enumerate(local_values):
             if not is_xyz(position):
                 continue
             offset = -0.09 if hand.get("handedness") == "Left" else 0.09
@@ -228,13 +229,13 @@ def load_triangulated_frames(path: Path, stride: int, max_frames: int | None, gr
     frames = []
     for source_index, record in enumerate(iter_jsonl(path)):
         record_type = record.get("type")
-        if record_type not in {"triangulated_mediapipe_hand_frame", "hand_local_refined_frame", "hamer_primary_local_frame", "hamer_mano_local_refined_frame", "hamer_mano_multiview_image_refined_frame", "glove_local_frame"}:
+        if record_type not in {"triangulated_mediapipe_hand_frame", "hand_local_refined_frame", "hamer_primary_local_frame", "hamer_palm_local_fused_frame", "hamer_mano_local_refined_frame", "hamer_mano_multiview_image_refined_frame", "glove_local_frame"}:
             continue
         if group_ids is not None and int(record["group_id"]) not in group_ids:
             continue
         if source_index % stride != 0:
             continue
-        if record_type in {"hamer_primary_local_frame", "hamer_mano_local_refined_frame", "hamer_mano_multiview_image_refined_frame"}:
+        if record_type in {"hamer_primary_local_frame", "hamer_palm_local_fused_frame", "hamer_mano_local_refined_frame", "hamer_mano_multiview_image_refined_frame"}:
             record = normalize_hamer_local_frame(record)
         frames.append(record)
         if max_frames is not None and len(frames) >= max_frames:

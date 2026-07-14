@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", default="left_index", choices=sorted(DATASET_PRESETS), help="Named dataset preset.")
     parser.add_argument("--base-dir", type=Path, default=DEFAULT_BASE_DIR)
     parser.add_argument("--triangulated", type=Path, help="Explicit hamer_local_hands JSONL path.")
+    parser.add_argument("--zero-shot", action="store_true", help="View the zero-shot palm-local fusion output as a skeleton.")
     parser.add_argument(
         "--glove",
         choices=["left_index", "right_index", "left_index_synced", "right_index_synced"],
@@ -121,6 +122,10 @@ def main() -> None:
         args.render_mode = "skeleton"
         args.no_mediapipe_overlay = True
         args.no_camera_rig = True
+    if args.zero_shot:
+        suffix = range_suffix(parse_group_ids(args.group_range, args.group_ids))
+        args.triangulated = args.base_dir / "hamer_palm_local_fused" / f"palm_local_hands_{suffix}.jsonl"
+        args.render_mode = "skeleton"
 
     viewer = Path(__file__).resolve().parent / "view_triangulated_hands_rgb.py"
     triangulated = args.triangulated or default_triangulated_path(args.base_dir, args.group_range, args.group_ids)

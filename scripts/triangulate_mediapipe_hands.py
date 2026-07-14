@@ -83,6 +83,11 @@ def parse_args() -> argparse.Namespace:
         help="Camera calibration YAML containing T_H_C.",
     )
     parser.add_argument(
+        "--tracked-hands",
+        type=Path,
+        help="Optional stabilized SAM3 tracks used only to associate MediaPipe hands across cameras.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         help="Output directory. Defaults to DETECTIONS parent / triangulated.",
@@ -106,6 +111,8 @@ def parse_args() -> argparse.Namespace:
         default=0.05,
         help="Reject triangulated landmarks whose worst ray distance exceeds this many meters.",
     )
+    parser.add_argument("--min-depth-m", type=float, default=0.05, help="Reject intersections behind or extremely close to a camera.")
+    parser.add_argument("--max-depth-m", type=float, default=1.0, help="Reject ill-conditioned intersections beyond this head-camera working depth.")
     parser.add_argument(
         "--match-key",
         choices=["handedness", "single"],
@@ -155,44 +162,94 @@ def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
 
 
 def group_detections(path: Path, max_groups: int | None, stride: int) -> Iterable[tuple[int, list[dict[str, Any]]]]:
-    current_group = None
-    records: list[dict[str, Any]] = []
-    yielded = 0
-
-    def should_emit(group_id: int) -> bool:
-        return group_id % stride == 0
-
+    records_by_group: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for record in iter_jsonl(path):
         group_id = int(record["group_id"])
-        if current_group is None:
-            current_group = group_id
-        if group_id != current_group:
-            if should_emit(current_group):
-                yield current_group, records
-                yielded += 1
-                if max_groups is not None and yielded >= max_groups:
-                    return
-            current_group = group_id
-            records = []
-        records.append(record)
+        records_by_group[group_id].append(record)
 
-    if current_group is not None and records and should_emit(current_group):
-        if max_groups is None or yielded < max_groups:
-            yield current_group, records
+    yielded = 0
+    for group_id in sorted(records_by_group):
+        if group_id % stride != 0:
+            continue
+        yield group_id, records_by_group[group_id]
+        yielded += 1
+        if max_groups is not None and yielded >= max_groups:
+            return
 
 
-def choose_hands(record: dict[str, Any], match_key: str, min_handedness_score: float) -> dict[str, dict[str, Any]]:
+def hand_bbox(hand: dict[str, Any]) -> list[float] | None:
+    landmarks = hand.get("landmarks_rectified_px") or []
+    points = [
+        (float(point["x"]), float(point["y"]))
+        for point in landmarks
+        if isinstance(point, dict)
+        and isinstance(point.get("x"), (int, float))
+        and isinstance(point.get("y"), (int, float))
+    ]
+    if not points:
+        return None
+    xs, ys = zip(*points)
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def bbox_iou(a: list[float] | None, b: list[float] | None) -> float:
+    if not a or not b or len(a) != 4 or len(b) != 4:
+        return 0.0
+    x1 = max(float(a[0]), float(b[0]))
+    y1 = max(float(a[1]), float(b[1]))
+    x2 = min(float(a[2]), float(b[2]))
+    y2 = min(float(a[3]), float(b[3]))
+    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    area_a = max(0.0, float(a[2]) - float(a[0])) * max(0.0, float(a[3]) - float(a[1]))
+    area_b = max(0.0, float(b[2]) - float(b[0])) * max(0.0, float(b[3]) - float(b[1]))
+    union = area_a + area_b - intersection
+    return intersection / union if union > 0.0 else 0.0
+
+
+def load_tracked_hands(path: Path | None) -> dict[tuple[int, str], list[dict[str, Any]]]:
+    tracked: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+    if path is None:
+        return tracked
+    for record in iter_jsonl(path):
+        group_id = int(record["group_id"])
+        camera_id = str(record["camera_id"])
+        tracked[(group_id, camera_id)].extend(record.get("hands") or [])
+    return tracked
+
+
+def tracked_handedness(hand: dict[str, Any], tracks: list[dict[str, Any]], min_iou: float = 0.25) -> str | None:
+    bbox = hand_bbox(hand)
+    best_handedness = None
+    best_iou = 0.0
+    for track in tracks:
+        handedness = track.get("locked_handedness") or track.get("handedness")
+        if handedness not in {"Left", "Right"}:
+            continue
+        overlap = bbox_iou(bbox, track.get("bbox"))
+        if overlap > best_iou:
+            best_iou = overlap
+            best_handedness = str(handedness)
+    return best_handedness if best_iou >= min_iou else None
+
+
+def choose_hands(
+    record: dict[str, Any],
+    match_key: str,
+    min_handedness_score: float,
+    tracks: list[dict[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
     hands = record.get("hands") or []
     selected: dict[str, dict[str, Any]] = {}
 
     for hand in hands:
+        track_handedness = tracked_handedness(hand, tracks or [])
         if match_key == "single":
             key = "hand"
         else:
-            key = hand.get("handedness") or "unknown"
+            key = track_handedness or hand.get("handedness") or "unknown"
         score = hand.get("handedness_score")
         score = float(score) if isinstance(score, (int, float)) else -1.0
-        if score < min_handedness_score:
+        if track_handedness is None and score < min_handedness_score:
             continue
         old = selected.get(key)
         old_score = old.get("handedness_score") if old else None
@@ -257,16 +314,21 @@ def select_best_triangulation(
             if has_primary and primary_camera not in {camera_id for camera_id, _, _ in combo}:
                 continue
             point, mean_error, max_error = triangulate_rays(list(combo))
+            depths = [ray_depth(point, origin, direction) for _camera_id, origin, direction in combo]
+            depth_valid = all(args.min_depth_m <= depth <= args.max_depth_m for depth in depths)
             item = {
                 "rays": list(combo),
                 "point": point,
                 "mean_ray_error_m": mean_error,
                 "max_ray_error_m": max_error,
                 "source_cameras": [camera_id for camera_id, _, _ in combo],
+                "min_depth_m": float(min(depths)),
+                "max_depth_m": float(max(depths)),
             }
-            if mean_error <= args.max_mean_ray_error_m and max_error <= args.max_ray_error_m:
+            if depth_valid and mean_error <= args.max_mean_ray_error_m and max_error <= args.max_ray_error_m:
                 candidates.append(item)
             else:
+                item["rejected_reason"] = "depth" if not depth_valid else "ray_error"
                 rejected.append(item)
 
     if not candidates:
@@ -275,13 +337,13 @@ def select_best_triangulation(
         best_rejected = min(
             rejected,
             key=lambda item: (
+                item["rejected_reason"] == "depth",
                 item["mean_ray_error_m"] > args.max_mean_ray_error_m,
                 item["max_ray_error_m"] > args.max_ray_error_m,
                 item["mean_ray_error_m"],
                 item["max_ray_error_m"],
             ),
         )
-        best_rejected["rejected_reason"] = "ray_error"
         return best_rejected
 
     return min(
@@ -300,6 +362,7 @@ def triangulate_group(
     camera_poses: dict[str, tuple[np.ndarray, np.ndarray]],
     args: argparse.Namespace,
     depth_history: dict[tuple[str, int], float],
+    tracked_hands: dict[tuple[int, str], list[dict[str, Any]]],
 ) -> dict[str, Any]:
     hands_by_key: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
     timestamps = []
@@ -310,7 +373,8 @@ def triangulate_group(
             continue
         if record.get("timestamp_unix_ns") is not None:
             timestamps.append(int(record["timestamp_unix_ns"]))
-        for key, hand in choose_hands(record, args.match_key, args.min_handedness_score).items():
+        tracks = tracked_hands.get((group_id, camera_id), [])
+        for key, hand in choose_hands(record, args.match_key, args.min_handedness_score, tracks).items():
             hands_by_key[key][camera_id] = hand
 
     output_hands = []
@@ -384,7 +448,7 @@ def triangulate_group(
                 )
                 continue
 
-            if selected is not None and selected.get("rejected_reason") == "ray_error":
+            if selected is not None and selected.get("rejected_reason"):
                 rejected_count += 1
 
             primary_ray = None
@@ -414,7 +478,7 @@ def triangulate_group(
                     )
                     continue
 
-            if selected is not None and selected.get("rejected_reason") == "ray_error":
+            if selected is not None and selected.get("rejected_reason"):
                 joints.append(
                     {
                         "name": landmark_name,
@@ -429,7 +493,7 @@ def triangulate_group(
                         "mean_ray_error_m": selected["mean_ray_error_m"],
                         "max_ray_error_m": selected["max_ray_error_m"],
                         "mean_handedness_score": mean_score,
-                        "rejected_reason": "ray_error",
+                        "rejected_reason": selected["rejected_reason"],
                     }
                 )
             else:
@@ -471,13 +535,14 @@ def triangulate_group(
 
 def triangulate_file(args: argparse.Namespace, output_jsonl: Path) -> Counter:
     camera_poses = load_camera_poses(args.calib)
+    tracked_hands = load_tracked_hands(args.tracked_hands)
     stats: Counter = Counter()
     depth_history: dict[tuple[str, int], float] = {}
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
     with output_jsonl.open("w", encoding="utf-8") as out:
         for group_id, records in group_detections(args.detections, args.max_groups, args.stride):
-            frame = triangulate_group(group_id, records, camera_poses, args, depth_history)
+            frame = triangulate_group(group_id, records, camera_poses, args, depth_history, tracked_hands)
             stats["frames"] += 1
             stats["hands"] += len(frame["hands"])
             for hand in frame["hands"]:
@@ -711,11 +776,14 @@ def write_config(args: argparse.Namespace, output_dir: Path, output_jsonl: Path,
     config = {
         "detections": str(args.detections),
         "calib": str(args.calib),
+        "tracked_hands": str(args.tracked_hands) if args.tracked_hands else None,
         "output_jsonl": str(output_jsonl),
         "min_views": args.min_views,
         "min_handedness_score": args.min_handedness_score,
         "max_mean_ray_error_m": args.max_mean_ray_error_m,
         "max_ray_error_m": args.max_ray_error_m,
+        "min_depth_m": args.min_depth_m,
+        "max_depth_m": args.max_depth_m,
         "primary_cameras": PRIMARY_CAMERAS,
         "match_key": args.match_key,
         "allow_invalid_original": bool(args.allow_invalid_original),
@@ -740,12 +808,16 @@ def main() -> None:
         raise SystemExit("--min-handedness-score must be non-negative")
     if args.max_mean_ray_error_m <= 0.0 or args.max_ray_error_m <= 0.0:
         raise SystemExit("ray error thresholds must be positive")
+    if args.min_depth_m <= 0.0 or args.max_depth_m <= args.min_depth_m:
+        raise SystemExit("depth thresholds must satisfy 0 < min-depth < max-depth")
     if args.stride < 1:
         raise SystemExit("--stride must be at least 1")
     if not args.detections.exists():
         raise SystemExit(f"detections not found: {args.detections}")
     if not args.calib.exists():
         raise SystemExit(f"calib not found: {args.calib}")
+    if args.tracked_hands is not None and not args.tracked_hands.exists():
+        raise SystemExit(f"tracked hands not found: {args.tracked_hands}")
 
     output_dir = args.output_dir or (args.detections.parent / "triangulated_primary_strict")
     output_jsonl = output_dir / "triangulated_hands.jsonl"
