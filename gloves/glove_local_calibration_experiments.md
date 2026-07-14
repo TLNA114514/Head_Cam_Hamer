@@ -1,6 +1,7 @@
 # Glove-Local Calibration Experiments
 
-Full Chinese translation: `gloves/glove_local_calibration_experiments.zh.md`.
+Chinese beginner overview: `gloves/glove_local_calibration_experiments.zh.md`.
+Chinese technical appendix: `gloves/glove_local_calibration_experiments.technical.zh.md`.
 Inference speed, latency, and replacement-model research is kept separately in
 `docs/hamer_inference_optimization.md`.
 

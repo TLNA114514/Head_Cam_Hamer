@@ -100,7 +100,7 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Save every HaMeR rendered overlay. Disabled by default to avoid full-sequence I/O; use selected debug/viewer outputs instead.",
     )
-    parser.add_argument("--prompt-preset", choices=["bare", "gloved", "custom"], default="bare")
+    parser.add_argument("--prompt-preset", choices=["bare", "gloved", "realtime", "custom"], default="bare")
     parser.add_argument("--prompt", action="append", dest="prompts")
     parser.add_argument(
         "--hand-track-backend",

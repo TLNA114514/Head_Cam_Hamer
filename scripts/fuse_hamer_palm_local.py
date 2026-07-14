@@ -151,17 +151,20 @@ def palm_local(points: np.ndarray, joints: np.ndarray) -> np.ndarray:
 
 
 def candidate_from_record(record: dict[str, Any], args: argparse.Namespace) -> dict[str, Any] | None:
-    if not is_xyz_list(record.get("hamer_joints_cam"), minimum_length=21):
+    joints_value = record.get("hand_mesh_joints_cam") or record.get("hamer_joints_cam")
+    if not is_xyz_list(joints_value, minimum_length=21):
         return None
-    joints_cam = np.asarray(record["hamer_joints_cam"], dtype=np.float64)
+    joints_cam = np.asarray(joints_value, dtype=np.float64)
     local_joints = palm_local(joints_cam[:21], joints_cam[:21])
     local_vertices = None
-    if args.include_vertices and is_xyz_list(record.get("hamer_vertices_cam")):
-        vertices_cam = np.asarray(record["hamer_vertices_cam"], dtype=np.float64)
+    vertices_value = record.get("hand_mesh_vertices_cam") or record.get("hamer_vertices_cam")
+    if args.include_vertices and is_xyz_list(vertices_value):
+        vertices_cam = np.asarray(vertices_value, dtype=np.float64)
         local_vertices = palm_local(vertices_cam, joints_cam[:21])
     score, score_parts = prediction_quality(record, args)
     return {
         "record": record,
+        "model_name": str(record.get("model_name") or "hamer"),
         "camera_id": str(record["camera_id"]),
         "joints": local_joints,
         "vertices": local_vertices,
@@ -178,7 +181,7 @@ def load_candidates(
     )
     for path in paths:
         for record in iter_jsonl(path):
-            if record.get("type") != "hamer_multiview_prediction":
+            if record.get("type") not in {"hamer_multiview_prediction", "hand_mesh_multiview_prediction"}:
                 continue
             group_id = int(record["group_id"])
             if group_ids is not None and group_id not in group_ids:
@@ -479,6 +482,7 @@ def main() -> None:
                     "local_shape_valid": True,
                     "fusion_view_count": len(items),
                     "used_cameras": [item["camera_id"] for item in items],
+                    "source_models": sorted({item["model_name"] for item in items}),
                     "palm_local_joints_m": primary_joints.tolist(),
                     "raw_palm_local_joints_m": fused["raw_joints"].tolist(),
                     "static_calibrated_palm_local_joints_m": fused["static_joints"].tolist(),

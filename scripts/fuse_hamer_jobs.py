@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fuse MediaPipe and SAM3 detections into per-view HaMeR jobs."""
+"""Fuse optional MediaPipe and SAM3 detections into per-view hand-mesh jobs."""
 
 from __future__ import annotations
 
@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frames", type=Path, default=DEFAULT_FRAMES)
     parser.add_argument("--rectified-dir", type=Path, default=DEFAULT_BASE_DIR / "rectified_for_hamer")
     parser.add_argument("--mediapipe", type=Path, default=DEFAULT_BASE_DIR / "landmarks.jsonl")
+    parser.add_argument("--use-mediapipe", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sam3", type=Path, help="SAM3 JSONL. Defaults to output-dir sibling sam3_bboxes by range.")
     parser.add_argument("--tracked-hands", type=Path, help="Stabilized SAM3 tracks JSONL. Overrides --sam3 when provided.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_BASE_DIR / "hamer_jobs")
@@ -54,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-frame-mode", choices=["none", "gray", "blur"], default="blur")
     parser.add_argument("--mask-frame-dilate", type=int, default=9)
     parser.add_argument("--mask-feather", type=int, default=11)
+    parser.add_argument("--save-debug", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--camera-handedness-override",
         default="none",
@@ -418,16 +420,21 @@ def main() -> None:
 
     records = filter_frame_records(args.frames, cameras, group_ids)
     if args.dry_run:
-        print(json.dumps({"records": len(records), "sam3": str(sam3_path), "suffix": suffix}, indent=2))
+        print(
+            json.dumps(
+                {"records": len(records), "sam3": str(sam3_path), "use_mediapipe": args.use_mediapipe, "suffix": suffix},
+                indent=2,
+            )
+        )
         return
     if output_path.exists() and not args.overwrite:
         raise SystemExit(f"{output_path} exists; pass --overwrite to replace it")
-    if not args.mediapipe.exists():
+    if args.use_mediapipe and not args.mediapipe.exists():
         raise SystemExit(f"MediaPipe detections not found: {args.mediapipe}")
     if not sam3_path.exists():
         raise SystemExit(f"SAM3 detections not found: {sam3_path}")
 
-    mp = load_mediapipe(args.mediapipe, cameras, group_ids, args.min_mediapipe_score)
+    mp = load_mediapipe(args.mediapipe, cameras, group_ids, args.min_mediapipe_score) if args.use_mediapipe else {}
     sam3 = load_sam3(sam3_path, cameras, group_ids)
     stats = defaultdict(int)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -438,13 +445,14 @@ def main() -> None:
             key = (group_id, camera_id)
             image_path = args.rectified_dir / rectified_rel_path(record)
             jobs = fuse_one(group_id, camera_id, image_path, mp.get(key, []), sam3.get(key, []), args, handedness_overrides, handedness_priors)
-            draw_debug(
-                image_path,
-                mp.get(key, []),
-                sam3.get(key, []),
-                jobs,
-                args.output_dir / "debug" / camera_id / f"{group_id:08d}.jpg",
-            )
+            if args.save_debug:
+                draw_debug(
+                    image_path,
+                    mp.get(key, []),
+                    sam3.get(key, []),
+                    jobs,
+                    args.output_dir / "debug" / camera_id / f"{group_id:08d}.jpg",
+                )
             stats["frames"] += 1
             stats["jobs"] += len(jobs)
             for job in jobs:
@@ -476,7 +484,9 @@ def main() -> None:
     with (args.output_dir / f"hamer_jobs_config_{suffix}.json").open("w", encoding="utf-8") as f:
         json.dump(
             {
-                "mediapipe": str(args.mediapipe),
+                "mediapipe": str(args.mediapipe) if args.use_mediapipe else None,
+                "use_mediapipe": args.use_mediapipe,
+                "save_debug": args.save_debug,
                 "sam3": str(sam3_path),
                 "output_path": str(output_path),
                 "group_range": args.group_range,

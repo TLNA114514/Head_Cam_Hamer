@@ -7,10 +7,13 @@ import argparse
 import json
 import os
 import sys
+import time
+from collections import defaultdict
 from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 from PIL import Image
 
 from hamer_multiview_utils import (
@@ -48,6 +51,7 @@ from run_sam3_bbox_on_video import (  # type: ignore  # noqa: E402
 PROMPT_PRESETS = {
     "bare": ["bare hand", "human hand", "hand", "left hand", "right hand"],
     "gloved": ["black fingerless glove", "fingerless glove", "gloved hand", "hand wearing black glove"],
+    "realtime": ["hand"],
     "custom": [],
 }
 
@@ -63,9 +67,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-hf", action="store_true")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--amp-dtype", choices=["float32", "bfloat16", "float16"], default="float32")
+    parser.add_argument("--torch-threads", type=int, default=2)
     parser.add_argument("--cameras", default=",".join(DEFAULT_CAMERAS))
     parser.add_argument("--group-range")
     parser.add_argument("--group-ids")
+    parser.add_argument("--frame-stride", type=int, default=1, help="Run SAM3 on every Nth frame per camera.")
+    parser.add_argument("--frame-offset", type=int, default=0, help="Per-camera sequence offset used with --frame-stride.")
     parser.add_argument("--prompt-preset", choices=sorted(PROMPT_PRESETS), default="bare")
     parser.add_argument("--prompt", action="append", dest="prompts")
     parser.add_argument("--confidence-threshold", type=float, default=0.35)
@@ -83,6 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-bbox-debug", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--progress-every", type=int, default=10, help="Print line-based progress every N images; 0 disables.")
     parser.add_argument("--progress-position", type=int, default=int(os.environ.get("TQDM_POSITION", "0")), help="tqdm terminal row position.")
+    parser.add_argument("--stream-output", action="store_true", help="Flush every keyframe record for downstream consumers.")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -103,6 +111,21 @@ def build_prompts(args: argparse.Namespace) -> list[str]:
     return unique
 
 
+def select_stride_records(records: list[dict], stride: int, offset: int) -> list[dict]:
+    by_camera: dict[str, list[dict]] = defaultdict(list)
+    for record in records:
+        by_camera[str(record["camera_id"])].append(record)
+    selected = []
+    for camera_records in by_camera.values():
+        camera_records.sort(key=lambda record: int(record["group_id"]))
+        selected.extend(
+            record
+            for sequence_index, record in enumerate(camera_records)
+            if sequence_index % stride == offset
+        )
+    return sorted(selected, key=lambda record: (int(record["group_id"]), str(record["camera_id"])))
+
+
 def save_masks(hands: list[dict], mask_dir: Path, group_id: int, camera_id: str) -> list[dict]:
     out = []
     mask_dir.mkdir(parents=True, exist_ok=True)
@@ -119,6 +142,10 @@ def save_masks(hands: list[dict], mask_dir: Path, group_id: int, camera_id: str)
 
 def main() -> None:
     args = parse_args()
+    if args.torch_threads < 1:
+        raise SystemExit("--torch-threads must be positive")
+    torch.set_num_threads(args.torch_threads)
+    cv2.setNumThreads(1)
     args.sam3_root = args.sam3_root.expanduser().resolve()
     if args.checkpoint:
         args.checkpoint = args.checkpoint.expanduser().resolve()
@@ -126,6 +153,8 @@ def main() -> None:
         os.environ["HF_ENDPOINT"] = args.hf_endpoint
     if args.max_hands < 1:
         raise SystemExit("--max-hands must be >= 1")
+    if args.frame_stride < 1 or not 0 <= args.frame_offset < args.frame_stride:
+        raise SystemExit("--frame-stride must be positive and --frame-offset must be in [0, stride)")
     if args.max_hands > 1 and args.merge_mode == "largest":
         args.merge_mode = "none"
     args.resolved_is_right = resolve_is_right(args.handedness, args.is_right)
@@ -133,11 +162,24 @@ def main() -> None:
     cameras = parse_cameras(args.cameras)
     group_ids = parse_group_ids(args.group_range, args.group_ids)
     suffix = range_suffix(group_ids)
-    records = filter_frame_records(args.frames, cameras, group_ids)
+    source_records = filter_frame_records(args.frames, cameras, group_ids)
+    records = select_stride_records(source_records, args.frame_stride, args.frame_offset)
     output_path = args.output_dir / f"sam3_bboxes_{suffix}.jsonl"
 
     if args.dry_run:
-        print(json.dumps({"records": len(records), "cameras": sorted(cameras), "suffix": suffix}, indent=2))
+        print(
+            json.dumps(
+                {
+                    "source_records": len(source_records),
+                    "records": len(records),
+                    "cameras": sorted(cameras),
+                    "frame_stride": args.frame_stride,
+                    "frame_offset": args.frame_offset,
+                    "suffix": suffix,
+                },
+                indent=2,
+            )
+        )
         return
     if output_path.exists() and not args.overwrite:
         raise SystemExit(f"{output_path} exists; pass --overwrite to replace it")
@@ -147,25 +189,34 @@ def main() -> None:
     from sam3.model_builder import build_sam3_image_model  # type: ignore
 
     prompts = build_prompts(args)
+    model_load_started = time.perf_counter()
     model = build_sam3_image_model(
         device=args.device,
         checkpoint_path=str(args.checkpoint) if args.checkpoint else None,
         load_from_HF=not args.no_hf,
     )
-    if args.device == "cuda" and args.amp_dtype != "float32":
-        model = model.to(dtype=torch_dtype_from_name(args.amp_dtype))
-    else:
-        model = model.float()
+    model = model.float()
     processor = Sam3Processor(model, device=args.device, confidence_threshold=args.confidence_threshold)
+    model_load_seconds = time.perf_counter() - model_load_started
+    cuda_enabled = args.device.startswith("cuda") and torch.cuda.is_available()
+    if cuda_enabled:
+        torch.cuda.reset_peak_memory_stats()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     mask_dir = args.output_dir / "masks" / suffix
     bbox_debug_dir = args.output_dir / "debug" / suffix
     mask_debug_dir = args.output_dir / "mask_debug" / suffix
 
-    stats = {"records": len(records), "frames_with_hands": 0, "hands": 0, "missing_images": 0}
+    stats = {
+        "source_records": len(source_records),
+        "records": len(records),
+        "frames_with_hands": 0,
+        "hands": 0,
+        "missing_images": 0,
+    }
+    inference_started = time.perf_counter()
     print(f"[SAM3] start cameras={','.join(sorted(cameras))} records={len(records)} output={output_path}", flush=True)
-    with output_path.open("w", encoding="utf-8") as out:
+    with output_path.open("w", encoding="utf-8", buffering=1 if args.stream_output else -1) as out:
         progress = tqdm(records, desc=f"SAM3 {','.join(sorted(cameras))}", unit="image", position=args.progress_position)
         for index, record in enumerate(progress, start=1):
             group_id = int(record["group_id"])
@@ -174,6 +225,23 @@ def main() -> None:
             image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
             if image_bgr is None:
                 stats["missing_images"] += 1
+                out.write(
+                    json.dumps(
+                        {
+                            "type": "sam3_multiview_bboxes",
+                            "group_id": group_id,
+                            "camera_id": camera_id,
+                            "rectified_image_path": str(image_path),
+                            "hands": [],
+                            "missing_image": True,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+                if args.stream_output:
+                    out.flush()
                 continue
             image_rgb = Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
             with inference_context(args):
@@ -208,8 +276,24 @@ def main() -> None:
                 )
                 + "\n"
             )
+            if args.stream_output:
+                out.flush()
             if args.progress_every > 0 and (index % args.progress_every == 0 or index == len(records)):
                 progress.set_postfix_str(f"group={group_id} hands={len(json_hands)} total={stats['hands']}")
+
+    if cuda_enabled:
+        torch.cuda.synchronize()
+    inference_seconds = time.perf_counter() - inference_started
+    timing = {
+        "model_load_seconds": model_load_seconds,
+        "inference_total_seconds": inference_seconds,
+        "keyframe_images_per_second": len(records) / inference_seconds if inference_seconds else None,
+        "source_multiview_frames_per_second": (
+            len(source_records) / max(1, len(cameras)) / inference_seconds if inference_seconds else None
+        ),
+    }
+    peak_cuda_allocated_mib = torch.cuda.max_memory_allocated() / 2**20 if cuda_enabled else None
+    peak_cuda_reserved_mib = torch.cuda.max_memory_reserved() / 2**20 if cuda_enabled else None
 
     config = {
         "sam3_root": str(args.sam3_root),
@@ -221,9 +305,16 @@ def main() -> None:
         "cameras": sorted(cameras),
         "group_range": args.group_range,
         "group_ids": args.group_ids,
+        "frame_stride": args.frame_stride,
+        "frame_offset": args.frame_offset,
         "prompt_preset": args.prompt_preset,
         "prompts": prompts,
         "max_hands": args.max_hands,
+        "amp_dtype": args.amp_dtype,
+        "torch_threads": args.torch_threads,
+        "timing": timing,
+        "peak_cuda_allocated_mib": peak_cuda_allocated_mib,
+        "peak_cuda_reserved_mib": peak_cuda_reserved_mib,
         "stats": stats,
     }
     with (args.output_dir / f"sam3_config_{suffix}.json").open("w", encoding="utf-8") as f:

@@ -55,7 +55,9 @@ Interactive visualization:
 Documentation:
 
 - Error and calibration experiments: `gloves/glove_local_calibration_experiments.md`
-- Chinese error and calibration experiments: `gloves/glove_local_calibration_experiments.zh.md`
-- Inference speed, latency, profiles, and faster-model survey: `docs/hamer_inference_optimization.md`
+- Chinese calibration overview: `gloves/glove_local_calibration_experiments.zh.md`
+- Chinese calibration technical appendix: `gloves/glove_local_calibration_experiments.technical.zh.md`
+- Inference optimization overview: `docs/hamer_inference_optimization.md`
+- Inference optimization technical appendix: `docs/hamer_inference_optimization.technical.md`
 
 Data, generated images, model weights, and intermediate outputs are intentionally ignored by git.
