@@ -1,0 +1,6 @@
+[submodule "wrist_cam"]
+	path = external/wrist_cam
+	url = https://github.com/TLNA114514/Wrist_Cam_Hamer.git
+[submodule "handmesh"]
+	path = external/HandMesh
+	url = https://github.com/SeanChenxy/HandMesh.git
