@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run sparse SAM3 keyframes, optical-flow tracking, MobRecon, and palm-local fusion."""
+"""Run rectification, sparse SAM3 tracking, MobRecon, and palm-local fusion."""
 
 from __future__ import annotations
 
@@ -17,13 +17,30 @@ from hamer_multiview_utils import parse_cameras, parse_group_ids, range_suffix
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-from dependency_paths import DEFAULT_SAM3_ROOT, default_conda_executable
+from dependency_paths import DEFAULT_MOBRECON_ROOT, DEFAULT_SAM3_ROOT, default_conda_executable
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-dir", type=Path, required=True)
     parser.add_argument("--frames", type=Path, required=True)
+    parser.add_argument(
+        "--image-root",
+        type=Path,
+        help="Root for image_path entries in frames.jsonl. Defaults to the frames file directory.",
+    )
+    parser.add_argument(
+        "--calib",
+        type=Path,
+        help="Camera calibration YAML. Defaults to cameras.yaml beside frames.jsonl.",
+    )
+    parser.add_argument("--rectify-focal-scale", type=float, default=0.30)
+    parser.add_argument(
+        "--prepare-rectified",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prepare/reuse base-dir/rectified_for_hamer before inference.",
+    )
     parser.add_argument("--cameras", default="C0,C2,C3")
     parser.add_argument("--group-range")
     parser.add_argument("--group-ids")
@@ -44,6 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sam3-python", type=Path, help="Explicit SAM3 Python; defaults to --sam3-conda-env.")
     parser.add_argument("--mobrecon-conda-env", default="hamer")
     parser.add_argument("--mobrecon-python", type=Path, help="Python with torch/OpenCV; defaults to current Python when available.")
+    parser.add_argument("--mobrecon-root", type=Path, default=DEFAULT_MOBRECON_ROOT)
+    parser.add_argument("--mobrecon-checkpoint", type=Path)
     parser.add_argument("--mobrecon-device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--mobrecon-precision", choices=["float32", "float16"], default="float32")
     parser.add_argument("--mobrecon-batch-size", type=int, default=8)
@@ -194,6 +213,28 @@ def main() -> None:
         or args.one_euro_beta < 0.0
     ):
         raise SystemExit("stride, VRAM, and threads must be positive; One-Euro values must be non-negative")
+    if args.rectify_focal_scale <= 0.0:
+        raise SystemExit("--rectify-focal-scale must be positive")
+    args.image_root = args.image_root or args.frames.parent
+    args.calib = args.calib or (args.frames.parent / "cameras.yaml")
+    if not args.frames.is_file():
+        raise SystemExit(f"frames metadata not found: {args.frames}")
+    if args.prepare_rectified and not args.image_root.is_dir():
+        raise SystemExit(f"image root not found: {args.image_root}")
+    if args.prepare_rectified and not args.calib.is_file():
+        raise SystemExit(f"camera calibration not found: {args.calib}")
+    if args.sam3_keyframes is not None and not args.sam3_keyframes.is_file():
+        raise SystemExit(f"SAM3 keyframe JSONL not found: {args.sam3_keyframes}")
+    if args.reference_sam3 is not None and not args.reference_sam3.is_file():
+        raise SystemExit(f"reference SAM3 JSONL not found: {args.reference_sam3}")
+    if args.sam3_keyframes is None and not (args.sam3_root / "sam3" / "__init__.py").is_file():
+        raise SystemExit(f"SAM3 root not found: {args.sam3_root}")
+    if args.sam3_checkpoint is not None and not args.sam3_checkpoint.is_file():
+        raise SystemExit(f"SAM3 checkpoint not found: {args.sam3_checkpoint}")
+    if not (args.mobrecon_root / "cmr" / "models" / "mobrecon_densestack.py").is_file():
+        raise SystemExit(f"MobRecon root not found: {args.mobrecon_root}")
+    if args.mobrecon_checkpoint is not None and not args.mobrecon_checkpoint.is_file():
+        raise SystemExit(f"MobRecon checkpoint not found: {args.mobrecon_checkpoint}")
     cameras = sorted(parse_cameras(args.cameras))
     if len(cameras) < 2:
         raise SystemExit("realtime multi-view mode requires at least two cameras")
@@ -205,6 +246,30 @@ def main() -> None:
     selected_range_args = range_args(args)
     stage_seconds: dict[str, float] = {}
     total_started = time.perf_counter()
+
+    if args.prepare_rectified:
+        rectify_command = [
+            sys.executable,
+            "-u",
+            script_path("prepare_hamer_rectified.py"),
+            "--image-root",
+            str(args.image_root),
+            "--frames",
+            str(args.frames),
+            "--calib",
+            str(args.calib),
+            "--output-dir",
+            str(rectified_dir),
+            "--cameras",
+            ",".join(cameras),
+            "--rectify-focal-scale",
+            str(args.rectify_focal_scale),
+            *range_args(args),
+            *(["--overwrite"] if args.overwrite else []),
+        ]
+        stage_seconds["rectify"] = run_command("rectify", rectify_command, args.dry_run)
+    elif not args.dry_run and not rectified_dir.is_dir():
+        raise SystemExit(f"rectified image cache not found: {rectified_dir}")
 
     keyframe_reused = args.sam3_keyframes is not None
     sam3_configs: list[Path] = []
@@ -279,6 +344,8 @@ def main() -> None:
             str(rectified_dir),
             "--output-dir",
             str(cpu_dir),
+            "--mobrecon-root",
+            str(args.mobrecon_root),
             "--cameras",
             ",".join(cameras),
             "--keyframe-stride",
@@ -302,6 +369,8 @@ def main() -> None:
             *selected_range_args,
             *overwrite,
         ]
+        if args.mobrecon_checkpoint:
+            cpu_command.extend(["--checkpoint", str(args.mobrecon_checkpoint)])
         if keyframe_reused:
             cpu_command.extend(["--keyframe-sam3", str(keyframe_path)])
         else:
@@ -337,10 +406,16 @@ def main() -> None:
         config = {
             "base_dir": str(args.base_dir),
             "frames_metadata": str(args.frames),
+            "image_root": str(args.image_root),
+            "camera_calibration": str(args.calib),
+            "rectify_focal_scale": args.rectify_focal_scale,
+            "prepare_rectified": args.prepare_rectified,
             "cameras": cameras,
             "keyframe_stride": args.keyframe_stride,
             "sam3_torch_threads": args.sam3_torch_threads,
             "mobrecon_torch_threads": args.mobrecon_torch_threads,
+            "mobrecon_root": str(args.mobrecon_root),
+            "mobrecon_checkpoint": str(args.mobrecon_checkpoint) if args.mobrecon_checkpoint else None,
             "one_euro_min_cutoff": args.one_euro_min_cutoff,
             "one_euro_beta": args.one_euro_beta,
             "mobrecon_precision": args.mobrecon_precision,
@@ -372,7 +447,10 @@ def main() -> None:
         print(f"wrote: {config_path}")
         return
 
-    sam3_peak_reserved, peak_sum_mib = sam3_memory_gate(sam3_configs, args.vram_budget_gib)
+    if args.dry_run:
+        sam3_peak_reserved, peak_sum_mib = [], None
+    else:
+        sam3_peak_reserved, peak_sum_mib = sam3_memory_gate(sam3_configs, args.vram_budget_gib)
 
     tracks_dir = output_root / "sam3_sparse_tracks"
     tracks_path = tracks_dir / f"sam3_sparse_tracks_{suffix}.jsonl"
@@ -437,6 +515,8 @@ def main() -> None:
         str(jobs_path),
         "--output-dir",
         str(mobrecon_dir),
+        "--mobrecon-root",
+        str(args.mobrecon_root),
         "--batch-size",
         str(args.mobrecon_batch_size),
         "--torch-threads",
@@ -450,6 +530,8 @@ def main() -> None:
         *selected_range_args,
         *overwrite,
     ]
+    if args.mobrecon_checkpoint:
+        mobrecon_command.extend(["--checkpoint", str(args.mobrecon_checkpoint)])
     stage_seconds["mobrecon"] = run_command("mobrecon", mobrecon_command, args.dry_run)
 
     fused_dir = output_root / "palm_local_fused"
@@ -485,10 +567,16 @@ def main() -> None:
     config = {
         "base_dir": str(args.base_dir),
         "frames_metadata": str(args.frames),
+        "image_root": str(args.image_root),
+        "camera_calibration": str(args.calib),
+        "rectify_focal_scale": args.rectify_focal_scale,
+        "prepare_rectified": args.prepare_rectified,
         "cameras": cameras,
         "keyframe_stride": args.keyframe_stride,
         "sam3_torch_threads": args.sam3_torch_threads,
         "mobrecon_torch_threads": args.mobrecon_torch_threads,
+        "mobrecon_root": str(args.mobrecon_root),
+        "mobrecon_checkpoint": str(args.mobrecon_checkpoint) if args.mobrecon_checkpoint else None,
         "one_euro_min_cutoff": args.one_euro_min_cutoff,
         "one_euro_beta": args.one_euro_beta,
         "mobrecon_precision": args.mobrecon_precision,

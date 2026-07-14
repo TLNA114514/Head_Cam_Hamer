@@ -2,8 +2,8 @@
 
 **语言 / Language**: 中文 | [English](README.md)
 
-本项目从同步、已标定的头戴相机图像中重建手部。完整流水线组合了 MediaPipe
-关节点、SAM3 分割、HaMeR/MANO 网格恢复、多视角选择、时序身份稳定和手部局部坐标融合。
+本项目从同步、已标定的头戴相机图像中重建手部，提供两条可从统一入口切换的流水线：
+质量兼容的 HaMeR 路线，以及稀疏 SAM3、光流跟踪和 MobRecon 组成的低延迟路线。
 
 仓库在源码层面可以独立使用：经过验证的 Wrist Cam、HaMeR、SAM3 和 HandMesh
 源码都通过 Git submodule 固定版本；安装脚本负责创建隔离环境并下载所有允许公开分发的模型文件。
@@ -13,16 +13,14 @@
 ```text
 同步且已标定的多相机图像
   -> 图像去畸变与重映射
-  -> MediaPipe 关节点
-  -> SAM3 手部 mask 和 bbox
-  -> HaMeR 单视角 MANO 预测
-  -> 手部身份时序稳定
-  -> 多视角手部局部坐标融合
-  -> JSONL 结果和可选调试产物
+  ├─ HaMeR：MediaPipe + dense SAM3 -> HaMeR/MANO -> zero-shot 多视角融合
+  └─ MobRecon：sparse SAM3 keyframe -> 光流跟踪 -> MobRecon -> 在线多视角融合
+  -> palm-local JSONL 结果和可选调试产物
 ```
 
-默认路径输出零样本多视角融合结果。MANO 图像空间优化、旧版融合、手套标定和
-MobRecon 工具作为可选实验组件保留。
+`./scripts/run.sh` 默认仍选择 HaMeR，以兼容已有命令；通过 `--pipeline mobrecon`
+切到低延迟路线。两条路线共享输入格式和去畸变缓存，但不是参数完全相同的模型替换：
+MobRecon 路线不产生 MANO 参数，也不能运行依赖 MANO 的 refine。
 
 ## 支持范围
 
@@ -139,10 +137,19 @@ T_H_C 把相机坐标系中的点变换到公共头戴设备坐标系 H。
 
 ## 快速开始
 
-对任意兼容数据集运行完整流水线：
+### 选择 HaMeR 或 MobRecon
+
+统一入口接受 `--pipeline hamer|mobrecon`；默认值是 `hamer`。列出可用流水线：
+
+```bash
+./scripts/run.sh --list-pipelines
+```
+
+HaMeR 质量兼容路线：
 
 ```bash
 ./scripts/run.sh \
+  --pipeline hamer \
   --image-root /path/to/dataset \
   --frames /path/to/dataset/frames.jsonl \
   --calib /path/to/dataset/cameras.yaml \
@@ -152,6 +159,29 @@ T_H_C 把相机坐标系中的点变换到公共头戴设备坐标系 H。
   --hamer-speed-profile quality \
   --camera-handedness-prior none
 ```
+
+MobRecon 低延迟路线会自行准备或复用 `rectified_for_hamer/` 去畸变缓存，不需要先跑 HaMeR：
+
+```bash
+./scripts/run.sh \
+  --pipeline mobrecon \
+  --image-root /path/to/dataset \
+  --frames /path/to/dataset/frames.jsonl \
+  --calib /path/to/dataset/cameras.yaml \
+  --base-dir outputs/my_realtime_run \
+  --cameras C0,C2,C3 \
+  --group-range 0-999 \
+  --keyframe-stride 10 \
+  --sam3-workers 2 \
+  --mobrecon-device cpu \
+  --mobrecon-precision float32 \
+  --mobrecon-torch-threads 8
+```
+
+这组 MobRecon 默认值对应当前已验证的“双 SAM3 GPU producer + CPU MobRecon”调度。
+固定使用 `C0,C2,C3` 只是现有设备上的吞吐配置；换设备或精度优先时应重新验证相机组合。
+一个 SAM3 worker 的常驻服务可测试 GPU FP32 MobRecon；两个 SAM3 worker 并行时，已有实测表明
+GPU 计算竞争反而可能降低整条流水线吞吐。
 
 `--image-root` 默认是 `frames.jsonl` 所在目录，`--calib` 默认是同目录下的
 `cameras.yaml`，所以通常可以简化为：
@@ -175,6 +205,9 @@ T_H_C 把相机坐标系中的点变换到公共头戴设备坐标系 H。
   --group-range 0-999
 ```
 
+该 `--prompt-preset` 示例属于 HaMeR 路线；MobRecon 实时路线内部固定使用为稀疏 keyframe
+验证过的 realtime prompt。
+
 只查看即将执行的命令，不运行推理：
 
 ```bash
@@ -188,7 +221,7 @@ T_H_C 把相机坐标系中的点变换到公共头戴设备坐标系 H。
 
 只有在确实需要替换已选范围内的现有结果时才加 `--overwrite`；否则支持复用的阶段会保留已有产物。
 
-## 推理配置
+## HaMeR 推理配置
 
 | 配置 | 用途 | 主要取舍 |
 | --- | --- | --- |
@@ -214,23 +247,136 @@ T_H_C 把相机坐标系中的点变换到公共头戴设备坐标系 H。
 --hamer-export-mano-params
 ```
 
-完整参数可以运行 `./scripts/run.sh --help` 查看。
+查看对应流水线的完整参数：
+
+```bash
+./scripts/run.sh --pipeline hamer --help
+./scripts/run.sh --pipeline mobrecon --help
+```
+
+## 方法开关与当前可用性
+
+两份技术文档中的方法并不都属于同一层开关：
+
+- pipeline 开关决定使用 HaMeR 还是 MobRecon；
+- zero-shot 输出开关决定哪个已计算字段复制到主 `palm_local_joints_m`；
+- glove-supervised calibration 是先用同步 glove 片段生成 profile，再 pure-apply 到新结果。
+
+按方法族统计，glove-local 的 5 类核心方法（静态映射、ridge residual、local KNN、
+pose/velocity residual、校准后 smoothing）已有 5/5 个可执行脚本；zero-shot 的
+`raw|static-calibrated|smoothed|causal-smoothed|adaptive-causal` 也已全部接入 HaMeR pipeline。
+可执行不等于适合作默认，当前状态如下：
+
+| 方法 | 入口或开关 | 状态 |
+| --- | --- | --- |
+| HaMeR 执行优化 | `--hamer-speed-profile quality|balanced|fast|aggressive` | 可直接用；默认 `quality` |
+| MobRecon 实时路线 | `--pipeline mobrecon` | 可直接用；默认 CPU FP32、stride 10 |
+| zero-shot raw / 因果 / 离线平滑 | `--zero-shot-primary-output ...` | 可直接切；raw 字段始终保留 |
+| physical-PnP + 0.04m view gate | `--run-mano-multiview-image-refine` | 可选图像侧 MANO refine；仅 HaMeR |
+| 静态 glove similarity + joint offsets | `calibrate_hamer_to_glove_local.py` | 有同步 glove 校准片段时的保守默认 |
+| ridge / local-KNN + OOD residual | `calibrate_pose_residual_local.py` | 可直接用；KNN 只用于 pose 密集覆盖 |
+| pose+velocity residual | 同上，`--feature-mode all-joints-velocity` | 实验性，含相邻帧，不是在线因果输出 |
+| 校准后 Hampel/EMA | `smooth_local_hands.py` | 离线 viewer 可选，收益很小 |
+| image-2D beta / 二阶时间 prior | `--image-beta-estimation-space image-2d` / `--image-temporal-acceleration-weight` | 已实现但收益不足，默认关闭 |
+| camera SE(3)、MediaPipe triangulation | 独立诊断脚本 | 仅诊断，不作为 pipeline switch |
+| WiLoR、Fast-HaMeR、Hamba | 无当前本地 worker/profile | 尚不能从本仓库直接切换 |
+
+### 切换 zero-shot 主输出
+
+HaMeR 默认把 raw 等权多视角结果作为主输出。因果部署可切换到 One-Euro：
+
+```bash
+./scripts/run.sh \
+  --pipeline hamer \
+  --frames /path/to/dataset/frames.jsonl \
+  --base-dir outputs/hamer_causal \
+  --zero-shot-primary-output adaptive-causal \
+  --zero-shot-one-euro-min-cutoff 0.2 \
+  --zero-shot-one-euro-beta 5.0
+```
+
+离线、允许读取未来帧时可使用 Gaussian 输出：
+
+```text
+--zero-shot-primary-output smoothed
+--zero-shot-temporal-radius 10
+--zero-shot-temporal-sigma 4
+```
+
+固定 EMA 使用 `causal-smoothed` 和正的 `--zero-shot-causal-ema-alpha`。这里的
+`static-calibrated` 只是**不读取 glove GT** 的 zero-shot 骨长归一化，需要同时设置正的
+`--zero-shot-bone-calibration-blend`；它不是下面的 glove-supervised profile。
+
+### 生成并应用 glove calibration profile
+
+从头生成 glove calibration 底座时，HaMeR pipeline 需要显式加入
+`--run-mano-local-refine`。推荐静态 profile 的拟合命令是：
+
+```bash
+conda run --no-capture-output -n headcam python scripts/calibrate_hamer_to_glove_local.py \
+  --hamer outputs/hamer_run/hamer_mano_local_refined/mano_local_hands_RANGE.jsonl \
+  --glove /path/to/synced_glove_local.jsonl \
+  --output outputs/calibration/static_calibrated_RANGE.jsonl \
+  --calibration-json outputs/calibration/static.profile.json \
+  --train-group-range 0-199 \
+  --space palm-local \
+  --allow-translation \
+  --joint-offsets mean \
+  --joint-offset-shrink-k 25 \
+  --max-joint-offset-m 0.025 \
+  --bone-scales none \
+  --write-mode separate
+```
+
+部署时不再需要 glove GT，直接 pure-apply 已保存的 profile：
+
+```bash
+conda run --no-capture-output -n headcam python scripts/calibrate_hamer_to_glove_local.py \
+  --hamer outputs/new_run/hamer_mano_local_refined/mano_local_hands_RANGE.jsonl \
+  --output outputs/new_run/glove_calibrated_RANGE.jsonl \
+  --load-calibration-json outputs/calibration/static.profile.json \
+  --space palm-local \
+  --write-mode separate
+```
+
+`write-mode=separate` 会保留原始 `palm_local_joints_m`，并写入
+`glove_calibrated_palm_local_joints_m`。如需 ridge/KNN residual，把上述静态输出作为
+`calibrate_pose_residual_local.py` 的输入；使用 `--calibration-json` 生成 residual profile，
+部署时用 `--load-calibration-json` 应用。推荐的保守 ridge 参数为：
+
+```text
+--space glove-calibrated-palm-local
+--regressor ridge
+--ridge-alpha 10
+--correction-shrink 0.75
+--max-correction-m 0.03
+--ood-gating knn-linear
+--write-mode separate
+```
+
+只有校准集密集覆盖目标 pose 时，才切到 `local-knn`、`--knn-k 2`、
+`--knn-bandwidth-scale 0.5` 和 `--max-correction-m 0.06`。HaMeR/MANO profile
+不能直接应用到 MobRecon 输出；如果要校准 MobRecon，必须用 MobRecon 输出重新拟合并独立验证 profile。
 
 ## 输出
 
 所有运行产物都写入 `--base-dir`。主要目录包括：
 
 ```text
-rectified_for_hamer/          去畸变图像缓存和标定元数据
+rectified_for_hamer/          两条路线共享的去畸变缓存（目录名为历史兼容名）
 sam3_bboxes/                  mask、bbox 和可选调试图
 sam3_tracks_stabilized/       时序稳定后的手部身份
 hamer_jobs/                   按相机生成的 HaMeR 任务
 hamer_per_view/               原始单视角预测
 hamer_palm_local_fused/       默认零样本手部局部坐标融合结果
 hamer_mano_multiview_refined/ 可选图像空间优化结果
+sam3_mobrecon_realtime/       MobRecon 默认输出根目录
+  sam3_keyframes/             稀疏 SAM3 检测
+  realtime_cpu/               MobRecon per-view 与在线融合结果
 ```
 
-面向后续使用的默认结果位于 `hamer_palm_local_fused/`。单视角结果会继续保留，便于检查或尝试其他融合方法。
+HaMeR 面向后续使用的默认结果位于 `hamer_palm_local_fused/`。MobRecon 的最终路径记录在
+`sam3_mobrecon_realtime/realtime_config_*.json` 的 `outputs.fused`；raw 与 One-Euro 结果会同时保留。
 
 ## 可移植依赖路径
 
@@ -252,7 +398,9 @@ export MOBRECON_ROOT=/path/to/HandMesh
 export CONDA_BIN=/path/to/conda
 export HEADCAM_ENV=headcam
 export HAMER_ENV=hamer
+export MOBRECON_ENV=hamer
 export SAM3_ENV=sam3hand
+export HEADCAM_PIPELINE=hamer
 ```
 
 支持显式路径参数的命令会优先使用命令行值。
