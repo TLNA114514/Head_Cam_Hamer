@@ -31,9 +31,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-dir", type=Path, default=DEFAULT_BASE_DIR)
     parser.add_argument(
+        "--image-root",
+        type=Path,
+        help="Root for image_path entries in frames.jsonl. Defaults to the frames file directory.",
+    )
+    parser.add_argument(
         "--frames",
         type=Path,
         help="Frame metadata JSONL. Defaults to the cameras_<dataset>/frames.jsonl matching --base-dir.",
+    )
+    parser.add_argument(
+        "--calib",
+        type=Path,
+        help="Camera calibration YAML. Defaults to cameras.yaml beside frames.jsonl.",
     )
     parser.add_argument("--mediapipe", type=Path, help="MediaPipe landmarks JSONL. Defaults to base-dir/landmarks.jsonl.")
     parser.add_argument("--rectify-focal-scale", type=float, default=0.30)
@@ -547,6 +557,14 @@ def main() -> None:
     if args.frames is None:
         args.frames = frames_path_for_base_dir(args.base_dir)
         emit(f"[pipeline] inferred frames metadata: {args.frames}")
+    args.image_root = args.image_root or args.frames.parent
+    args.calib = args.calib or (args.frames.parent / "cameras.yaml")
+    if not args.frames.is_file():
+        raise SystemExit(f"frames metadata not found: {args.frames}")
+    if not args.image_root.is_dir():
+        raise SystemExit(f"image root not found: {args.image_root}")
+    if not args.calib.is_file():
+        raise SystemExit(f"camera calibration not found: {args.calib}")
     if args.frame_rate is None:
         args.frame_rate = infer_frame_rate(args.frames, cameras[0])
         emit(f"[pipeline] inferred frame rate: {args.frame_rate:.3f} FPS")
@@ -583,8 +601,12 @@ def main() -> None:
         sys.executable,
         "-u",
         script_path("prepare_hamer_rectified.py"),
+        "--image-root",
+        str(args.image_root),
         "--frames",
         str(args.frames),
+        "--calib",
+        str(args.calib),
         "--output-dir",
         str(args.base_dir / "rectified_for_hamer"),
         "--cameras",
@@ -613,6 +635,10 @@ def main() -> None:
                             sys.executable,
                             "-u",
                             script_path("detect_mediapipe_hands.py"),
+                            "--input",
+                            str(args.image_root),
+                            "--calib",
+                            str(args.calib),
                             "--frames",
                             str(args.frames),
                             "--output",
@@ -1099,7 +1125,7 @@ def main() -> None:
             "--hamer-root",
             str(args.hamer_root),
             "--calib",
-            str(args.frames.parent / "cameras.yaml"),
+            str(args.calib),
             "--rectified-config",
             str(rectified_config_path),
             *(["--projection-correction", str(args.image_projection_correction)] if args.image_projection_correction else []),
