@@ -28,8 +28,7 @@ from hamer_multiview_utils import (
 from progress_utils import tqdm
 
 
-WRIST_CAM_ROOT = Path("/home/luojiangrui/ljr/wrist_cam")
-WRIST_SCRIPTS = WRIST_CAM_ROOT / "scripts"
+from dependency_paths import DEFAULT_SAM3_ROOT, WRIST_SCRIPTS
 if str(WRIST_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(WRIST_SCRIPTS))
 
@@ -44,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sequence-dir", type=Path, default=DEFAULT_BASE_DIR / "sam3_video_sequences")
     parser.add_argument("--seed-sam3", type=Path, help="Per-frame SAM3 bbox JSONL used for prompts and fallback.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_BASE_DIR / "sam3_tracks")
-    parser.add_argument("--sam3-root", type=Path, default=WRIST_CAM_ROOT / "third_party" / "sam3")
+    parser.add_argument("--sam3-root", type=Path, default=DEFAULT_SAM3_ROOT)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--hf-endpoint", default="https://hf-mirror.com")
     parser.add_argument("--no-hf", action="store_true")

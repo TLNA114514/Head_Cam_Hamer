@@ -14,7 +14,7 @@ from hamer_multiview_utils import DEFAULT_CAMERAS, parse_cameras, parse_group_id
 from progress_utils import tqdm
 
 
-WRIST_CAM_ROOT = Path("/home/luojiangrui/ljr/wrist_cam")
+from dependency_paths import DEFAULT_HAMER_ROOT, default_conda_executable
 
 
 ACTIVE_PROCS: set[subprocess.Popen] = set()
@@ -26,9 +26,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--group-range", required=True)
     parser.add_argument("--chunk-size", type=int, default=50)
     parser.add_argument("--cameras", default=",".join(DEFAULT_CAMERAS))
-    parser.add_argument("--conda-bin", default="/home/luojiangrui/miniconda3/bin/conda")
+    parser.add_argument("--conda-bin", default=default_conda_executable())
     parser.add_argument("--hamer-conda-env", default="hamer")
-    parser.add_argument("--hamer-root", type=Path, default=WRIST_CAM_ROOT / "third_party" / "hamer")
+    parser.add_argument("--hamer-root", type=Path, default=DEFAULT_HAMER_ROOT)
     parser.add_argument("--calib", type=Path, required=True)
     parser.add_argument("--rectified-config", type=Path, required=True)
     parser.add_argument("--rectify-focal-scale", type=float, default=0.30)

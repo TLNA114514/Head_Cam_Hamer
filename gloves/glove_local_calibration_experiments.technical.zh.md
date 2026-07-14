@@ -635,7 +635,7 @@ HaMeR fusion。
 部署安全的 raw 融合，同时把可选时序输出保存在独立字段：
 
 ```bash
-/home/luojiangrui/miniconda3/envs/headcam/bin/python scripts/fuse_hamer_palm_local.py \
+conda run --no-capture-output -n headcam python scripts/fuse_hamer_palm_local.py \
   --predictions video/sam3_hamer_left_index/hamer_per_view/hamer_predictions_000000_000442.jsonl \
   --output-dir video/sam3_hamer_left_index/hamer_palm_local_fused \
   --group-range 0-442 \
@@ -652,7 +652,7 @@ HaMeR fusion。
 `--primary-output smoothed`。查看 raw zero-shot skeleton：
 
 ```bash
-/home/luojiangrui/miniconda3/envs/headcam/bin/python scripts/view_hamer_multiview.py \
+conda run --no-capture-output -n headcam python scripts/view_hamer_multiview.py \
   --dataset left_index --range 0-442 --zero-shot
 ```
 

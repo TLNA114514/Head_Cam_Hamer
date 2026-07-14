@@ -20,7 +20,7 @@ from hamer_multiview_utils import DEFAULT_BASE_DIR, DEFAULT_CAMERAS, DEFAULT_FRA
 from progress_utils import tqdm
 
 
-WRIST_CAM_ROOT = Path("/home/luojiangrui/ljr/wrist_cam")
+from dependency_paths import DEFAULT_HAMER_ROOT, DEFAULT_SAM3_ROOT, default_conda_executable
 LOG_LOCK = Lock()
 TTY_STREAM = None
 PROC_LOCK = Lock()
@@ -45,10 +45,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-parallel-workers", type=int, default=2)
     parser.add_argument("--max-mediapipe-workers", type=int, default=4)
     parser.add_argument("--max-hamer-workers", type=int, default=1)
-    parser.add_argument("--conda-bin", default="/home/luojiangrui/miniconda3/bin/conda")
+    parser.add_argument("--conda-bin", default=default_conda_executable())
     parser.add_argument("--sam3-conda-env", default="sam3hand")
     parser.add_argument("--hamer-conda-env", default="hamer")
-    parser.add_argument("--sam3-root", type=Path, default=WRIST_CAM_ROOT / "third_party" / "sam3")
+    parser.add_argument("--sam3-root", type=Path, default=DEFAULT_SAM3_ROOT)
     parser.add_argument("--sam3-checkpoint", type=Path, help="Optional local SAM3 checkpoint. Prevents HuggingFace download when provided.")
     parser.add_argument("--sam3-no-hf", action="store_true", help="Do not allow SAM3 to download checkpoints from HuggingFace.")
     parser.add_argument("--sam3-hf-endpoint", default="https://hf-mirror.com", help="HF endpoint used by SAM3 downloads.")
@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Save full-frame SAM3 bbox and mask debug images.",
     )
-    parser.add_argument("--hamer-root", type=Path, default=WRIST_CAM_ROOT / "third_party" / "hamer")
+    parser.add_argument("--hamer-root", type=Path, default=DEFAULT_HAMER_ROOT)
     parser.add_argument(
         "--hamer-execution",
         choices=["per-sequence", "per-camera", "per-chunk"],
@@ -564,9 +564,9 @@ def main() -> None:
         raise SystemExit("no group ids selected from frames")
 
     if not args.sam3_root.exists():
-        raise SystemExit(f"SAM3 root not found: {args.sam3_root}. Reuse/setup wrist_cam first.")
+        raise SystemExit(f"SAM3 root not found: {args.sam3_root}. Run scripts/setup.sh first.")
     if not args.hamer_root.exists():
-        raise SystemExit(f"HaMeR root not found: {args.hamer_root}. Reuse/setup wrist_cam first.")
+        raise SystemExit(f"HaMeR root not found: {args.hamer_root}. Run scripts/setup.sh first.")
     if args.sam3_no_hf and args.sam3_checkpoint is None and not args.skip_sam3:
         raise SystemExit("--sam3-no-hf requires --sam3-checkpoint, otherwise SAM3 has no checkpoint to load.")
 

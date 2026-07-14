@@ -1,0 +1,17 @@
+name: headcam
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - numpy<2
+      - opencv-python==4.10.0.84
+      - mediapipe==0.10.21
+      - protobuf==4.25.9
+      - pandas
+      - pillow
+      - pyyaml
+      - scipy
+      - matplotlib
+      - tqdm

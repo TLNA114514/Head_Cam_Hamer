@@ -1,0 +1,8 @@
+name: hamer
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - gcc_linux-64=11
+  - gxx_linux-64=11

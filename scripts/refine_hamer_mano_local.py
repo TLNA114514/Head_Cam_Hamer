@@ -21,8 +21,7 @@ from hamer_multiview_utils import DEFAULT_BASE_DIR, iter_jsonl, parse_group_ids,
 from progress_utils import tqdm
 
 
-WRIST_CAM_ROOT = Path("/home/luojiangrui/ljr/wrist_cam")
-DEFAULT_HAMER_ROOT = WRIST_CAM_ROOT / "third_party" / "hamer"
+from dependency_paths import DEFAULT_HAMER_ROOT
 LANDMARK_NAMES = [
     "wrist",
     "thumb_cmc",

@@ -12,9 +12,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-DEFAULT_CHECKPOINT = Path(
-    "/home/luojiangrui/ljr/wrist_cam/third_party/hamer/_DATA/hamer_ckpts/checkpoints/hamer.ckpt"
-)
+from dependency_paths import DEFAULT_HAMER_ROOT
+
+
+DEFAULT_CHECKPOINT = DEFAULT_HAMER_ROOT / "_DATA" / "hamer_ckpts" / "checkpoints" / "hamer.ckpt"
 
 
 def parse_args() -> argparse.Namespace:

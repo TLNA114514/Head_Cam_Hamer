@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from dependency_paths import default_conda_executable
+
 from hamer_multiview_utils import DEFAULT_BASE_DIR, DEFAULT_FRAMES, parse_group_ids, range_suffix
 from sync_glove_to_camera import (
     default_output_path,
@@ -61,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interpolation", choices=["linear", "nearest"], default="linear")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--run-pipeline", action="store_true", help="Run SAM3+HaMeR/MANO pipeline before evaluation.")
-    parser.add_argument("--conda-bin", type=Path, default=Path("/home/luojiangrui/miniconda3/bin/conda"))
+    parser.add_argument("--conda-bin", type=Path, default=Path(default_conda_executable()))
     parser.add_argument("--pipeline-env", default="headcam")
     parser.add_argument("--max-parallel-workers", type=int, default=2)
     parser.add_argument("--hand-track-backend", choices=["image", "posthoc", "sam3-native"], default="posthoc")

@@ -22,8 +22,7 @@ from hamer_multiview_utils import DEFAULT_BASE_DIR, iter_jsonl, parse_group_ids,
 from progress_utils import tqdm
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MOBRECON_ROOT = REPO_ROOT / "third_party" / "HandMesh"
+from dependency_paths import DEFAULT_MOBRECON_ROOT
 MANO_TO_MPII = np.asarray([0, 13, 14, 15, 20, 1, 2, 3, 16, 4, 5, 6, 17, 10, 11, 12, 19, 7, 8, 9, 18])
 
 

@@ -22,8 +22,7 @@ from hamer_multiview_utils import HAND_CONNECTIONS, DEFAULT_BASE_DIR, iter_jsonl
 from progress_utils import tqdm
 
 
-WRIST_CAM_ROOT = Path("/home/luojiangrui/ljr/wrist_cam")
-DEFAULT_HAMER_ROOT = WRIST_CAM_ROOT / "third_party" / "hamer"
+from dependency_paths import DEFAULT_HAMER_ROOT
 LIGHT_BLUE = (0.65098039, 0.74117647, 0.85882353)
 _ORIGINAL_PRINT = builtins.print
 
@@ -384,7 +383,7 @@ def main() -> None:
 
     args.hamer_root = args.hamer_root.expanduser().resolve()
     if not args.hamer_root.exists():
-        raise SystemExit(f"HaMeR root not found: {args.hamer_root}. Run/setup wrist_cam HaMeR first.")
+        raise SystemExit(f"HaMeR root not found: {args.hamer_root}. Run scripts/setup.sh first.")
     sys.path.insert(0, str(args.hamer_root))
 
     from hamer.datasets.vitdet_dataset import ViTDetDataset  # type: ignore
@@ -395,7 +394,7 @@ def main() -> None:
     checkpoint_path = resolve_hamer_checkpoint(args.hamer_root, args.checkpoint)
     model_config_path = checkpoint_path.parent.parent / "model_config.yaml"
     if not checkpoint_path.exists():
-        raise SystemExit(f"HaMeR checkpoint not found: {checkpoint_path}. Reuse/setup wrist_cam HaMeR first.")
+        raise SystemExit(f"HaMeR checkpoint not found: {checkpoint_path}. Run scripts/setup.sh first.")
     if not model_config_path.exists():
         raise SystemExit(f"HaMeR model_config.yaml not found next to checkpoint: {model_config_path}")
     print(f"[HaMeR {args.camera_id or 'all'}] loading model checkpoint={checkpoint_path}", flush=True)

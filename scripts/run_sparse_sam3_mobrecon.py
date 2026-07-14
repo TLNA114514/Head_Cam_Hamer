@@ -17,7 +17,7 @@ from hamer_multiview_utils import parse_cameras, parse_group_ids, range_suffix
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-WRIST_CAM_ROOT = Path("/home/luojiangrui/ljr/wrist_cam")
+from dependency_paths import DEFAULT_SAM3_ROOT, default_conda_executable
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,14 +34,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vram-budget-gib", type=float, default=24.0)
     parser.add_argument("--sam3-keyframes", type=Path, help="Reuse existing SAM3 JSONL instead of running sparse detection.")
     parser.add_argument("--reference-sam3", type=Path, help="Dense SAM3 JSONL used only for tracker evaluation.")
-    parser.add_argument("--sam3-root", type=Path, default=WRIST_CAM_ROOT / "third_party" / "sam3")
+    parser.add_argument("--sam3-root", type=Path, default=DEFAULT_SAM3_ROOT)
     parser.add_argument("--sam3-checkpoint", type=Path)
     parser.add_argument("--sam3-no-hf", action="store_true")
     parser.add_argument("--sam3-amp-dtype", choices=["float32", "bfloat16", "float16"], default="float16")
     parser.add_argument("--sam3-torch-threads", type=int, default=2)
-    parser.add_argument("--conda-bin", default="/home/luojiangrui/miniconda3/bin/conda")
+    parser.add_argument("--conda-bin", default=default_conda_executable())
     parser.add_argument("--sam3-conda-env", default="sam3hand")
-    parser.add_argument("--sam3-python", type=Path, default=Path("/home/luojiangrui/miniconda3/envs/sam3hand/bin/python"))
+    parser.add_argument("--sam3-python", type=Path, help="Explicit SAM3 Python; defaults to --sam3-conda-env.")
     parser.add_argument("--mobrecon-conda-env", default="hamer")
     parser.add_argument("--mobrecon-python", type=Path, help="Python with torch/OpenCV; defaults to current Python when available.")
     parser.add_argument("--mobrecon-device", choices=["cpu", "cuda"], default="cpu")
@@ -65,7 +65,7 @@ def conda_python(conda_bin: str, environment: str) -> list[str]:
 
 
 def sam3_python(args: argparse.Namespace) -> list[str]:
-    if args.sam3_python.exists():
+    if args.sam3_python is not None and args.sam3_python.exists():
         return [str(args.sam3_python), "-u"]
     return conda_python(args.conda_bin, args.sam3_conda_env)
 
