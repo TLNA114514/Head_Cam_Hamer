@@ -3,9 +3,9 @@
 **Language / 语言**: English | [中文](README.zh.md)
 
 This project reconstructs hands from synchronized, calibrated head-camera
-images. It combines MediaPipe landmarks, SAM3 segmentation, HaMeR/MANO mesh
-recovery, multi-view selection, and hand-local fusion in one reproducible
-pipeline.
+images. It provides two pipelines behind one switch: a HaMeR path for quality
+and compatibility, and a low-latency path built from sparse SAM3, optical-flow
+tracking, and MobRecon.
 
 The repository is self-contained at the source level: compatible Wrist Cam,
 HaMeR, SAM3, and HandMesh sources are pinned as Git submodules. A setup script
@@ -17,17 +17,16 @@ assets.
 ```text
 synchronized calibrated camera images
   -> rectification
-  -> MediaPipe landmarks
-  -> SAM3 hand masks and boxes
-  -> HaMeR per-view MANO predictions
-  -> temporal identity stabilization
-  -> multi-view hand-local fusion
-  -> JSONL predictions and optional debug assets
+  +-- HaMeR: MediaPipe + dense SAM3 -> HaMeR/MANO -> zero-shot multi-view fusion
+  `-- MobRecon: sparse SAM3 keyframes -> optical flow -> MobRecon -> online multi-view fusion
+  -> palm-local JSONL predictions and optional debug assets
 ```
 
-The default path produces a zero-shot fused result. Experimental MANO image
-refinement, legacy fusion, glove calibration, and MobRecon tools remain
-available as opt-in components.
+`./scripts/run.sh` still selects HaMeR by default for backward compatibility;
+use `--pipeline mobrecon` for the low-latency path. Both paths use the same
+input format and rectification cache, but they are not parameter-identical
+model replacements: MobRecon does not produce MANO parameters and cannot run
+MANO-dependent refinement stages.
 
 ## What it supports
 
@@ -152,10 +151,20 @@ and should likewise be configured before it is enabled.
 
 ## Quick start
 
-Run the complete pipeline on any compatible dataset:
+### Select HaMeR or MobRecon
+
+The unified entry point accepts `--pipeline hamer|mobrecon`; the default is
+`hamer`. List the available pipelines with:
+
+```bash
+./scripts/run.sh --list-pipelines
+```
+
+HaMeR quality/compatibility path:
 
 ```bash
 ./scripts/run.sh \
+  --pipeline hamer \
   --image-root /path/to/dataset \
   --frames /path/to/dataset/frames.jsonl \
   --calib /path/to/dataset/cameras.yaml \
@@ -165,6 +174,32 @@ Run the complete pipeline on any compatible dataset:
   --hamer-speed-profile quality \
   --camera-handedness-prior none
 ```
+
+The MobRecon low-latency path prepares or reuses the
+`rectified_for_hamer/` cache itself, so HaMeR does not need to run first:
+
+```bash
+./scripts/run.sh \
+  --pipeline mobrecon \
+  --image-root /path/to/dataset \
+  --frames /path/to/dataset/frames.jsonl \
+  --calib /path/to/dataset/cameras.yaml \
+  --base-dir outputs/my_realtime_run \
+  --cameras C0,C2,C3 \
+  --group-range 0-999 \
+  --keyframe-stride 10 \
+  --sam3-workers 2 \
+  --mobrecon-device cpu \
+  --mobrecon-precision float32 \
+  --mobrecon-torch-threads 8
+```
+
+These MobRecon defaults match the validated two-SAM3-GPU-producer plus CPU
+MobRecon schedule. `C0,C2,C3` is a throughput configuration for the current
+rig, not a universal camera subset; validate camera combinations again for a
+different rig or a quality-first run. GPU FP32 MobRecon is worth testing with
+one resident SAM3 worker, but measured GPU contention reduced total throughput
+when two SAM3 workers ran concurrently.
 
 `--image-root` defaults to the directory containing `frames.jsonl`, and
 `--calib` defaults to `cameras.yaml` in that directory. Therefore the compact
@@ -189,6 +224,9 @@ For gloved hands:
   --group-range 0-999
 ```
 
+This `--prompt-preset` example belongs to the HaMeR path. The MobRecon realtime
+path uses the realtime prompt validated for its sparse keyframes.
+
 Inspect the generated commands without running inference:
 
 ```bash
@@ -203,7 +241,7 @@ Inspect the generated commands without running inference:
 Use `--overwrite` only when existing artifacts for the selected range should be
 replaced. Otherwise completed stages are reused where supported.
 
-## Inference profiles
+## HaMeR inference profiles
 
 | Profile | Intended use | Main trade-off |
 | --- | --- | --- |
@@ -230,7 +268,128 @@ Useful controls:
 --hamer-export-mano-params
 ```
 
-Run `./scripts/run.sh --help` for the full option set.
+Show the option set for either pipeline with:
+
+```bash
+./scripts/run.sh --pipeline hamer --help
+./scripts/run.sh --pipeline mobrecon --help
+```
+
+## Method switches and current availability
+
+The methods described in the two technical reports do not all belong to one
+switching layer:
+
+- the pipeline switch selects HaMeR or MobRecon;
+- the zero-shot output switch selects which computed field is copied to the
+  primary `palm_local_joints_m` field;
+- glove-supervised calibration first fits a profile from a synchronized glove
+  clip, then pure-applies that profile to new results.
+
+Grouped by method family, all 5 glove-local core families (static mapping,
+ridge residual, local KNN, pose/velocity residual, and post-calibration
+smoothing) have executable scripts. All 5 zero-shot primary outputs,
+`raw|static-calibrated|smoothed|causal-smoothed|adaptive-causal`, are also wired
+into the HaMeR pipeline. Runnable does not mean recommended as a default:
+
+| Method | Entry point or switch | Status |
+| --- | --- | --- |
+| HaMeR execution optimization | `--hamer-speed-profile quality|balanced|fast|aggressive` | Directly usable; `quality` is the default |
+| MobRecon realtime path | `--pipeline mobrecon` | Directly usable; CPU FP32 and stride 10 are the defaults |
+| Zero-shot raw, causal, and offline smoothing | `--zero-shot-primary-output ...` | Direct switch; the raw field is always preserved |
+| Physical-PnP plus 0.04m view gate | `--run-mano-multiview-image-refine` | Optional image-side MANO refinement; HaMeR only |
+| Static glove similarity plus joint offsets | `calibrate_hamer_to_glove_local.py` | Conservative default when a synchronized glove calibration clip exists |
+| Ridge/local-KNN plus OOD residual | `calibrate_pose_residual_local.py` | Directly usable; KNN requires dense target-pose coverage |
+| Pose-plus-velocity residual | Same script with `--feature-mode all-joints-velocity` | Experimental; uses neighboring frames and is not an online causal output |
+| Post-calibration Hampel/EMA | `smooth_local_hands.py` | Optional offline viewer output with very small measured gains |
+| Image-2D beta / second-order temporal prior | `--image-beta-estimation-space image-2d` / `--image-temporal-acceleration-weight` | Implemented, but gains are insufficient; disabled by default |
+| Camera SE(3), MediaPipe triangulation | Standalone diagnostic scripts | Diagnostics only, not pipeline switches |
+| WiLoR, Fast-HaMeR, Hamba | No current local worker/profile | Not directly switchable in this repository yet |
+
+### Switch the zero-shot primary output
+
+HaMeR uses the raw equal-weight multi-view result as its primary output by
+default. A causal deployment can select One-Euro instead:
+
+```bash
+./scripts/run.sh \
+  --pipeline hamer \
+  --frames /path/to/dataset/frames.jsonl \
+  --base-dir outputs/hamer_causal \
+  --zero-shot-primary-output adaptive-causal \
+  --zero-shot-one-euro-min-cutoff 0.2 \
+  --zero-shot-one-euro-beta 5.0
+```
+
+For offline processing that may inspect future frames, select the Gaussian
+output:
+
+```text
+--zero-shot-primary-output smoothed
+--zero-shot-temporal-radius 10
+--zero-shot-temporal-sigma 4
+```
+
+Fixed EMA uses `causal-smoothed` and a positive
+`--zero-shot-causal-ema-alpha`. Here, `static-calibrated` means zero-shot bone
+length normalization that **does not read glove ground truth**; it requires a
+positive `--zero-shot-bone-calibration-blend`. It is not the glove-supervised
+profile below.
+
+### Fit and apply a glove calibration profile
+
+When creating a glove-calibration base from scratch, explicitly add
+`--run-mano-local-refine` to the HaMeR pipeline. Fit the recommended static
+profile with:
+
+```bash
+conda run --no-capture-output -n headcam python scripts/calibrate_hamer_to_glove_local.py \
+  --hamer outputs/hamer_run/hamer_mano_local_refined/mano_local_hands_RANGE.jsonl \
+  --glove /path/to/synced_glove_local.jsonl \
+  --output outputs/calibration/static_calibrated_RANGE.jsonl \
+  --calibration-json outputs/calibration/static.profile.json \
+  --train-group-range 0-199 \
+  --space palm-local \
+  --allow-translation \
+  --joint-offsets mean \
+  --joint-offset-shrink-k 25 \
+  --max-joint-offset-m 0.025 \
+  --bone-scales none \
+  --write-mode separate
+```
+
+Deployment no longer needs glove ground truth; pure-apply the stored profile:
+
+```bash
+conda run --no-capture-output -n headcam python scripts/calibrate_hamer_to_glove_local.py \
+  --hamer outputs/new_run/hamer_mano_local_refined/mano_local_hands_RANGE.jsonl \
+  --output outputs/new_run/glove_calibrated_RANGE.jsonl \
+  --load-calibration-json outputs/calibration/static.profile.json \
+  --space palm-local \
+  --write-mode separate
+```
+
+`write-mode=separate` preserves `palm_local_joints_m` and writes
+`glove_calibrated_palm_local_joints_m`. For a ridge/KNN residual, feed that
+static output to `calibrate_pose_residual_local.py`; use `--calibration-json`
+to save a residual profile and `--load-calibration-json` to apply it. The
+conservative ridge settings are:
+
+```text
+--space glove-calibrated-palm-local
+--regressor ridge
+--ridge-alpha 10
+--correction-shrink 0.75
+--max-correction-m 0.03
+--ood-gating knn-linear
+--write-mode separate
+```
+
+Only switch to `local-knn`, `--knn-k 2`, `--knn-bandwidth-scale 0.5`, and
+`--max-correction-m 0.06` when the calibration set densely covers the target
+pose space. A HaMeR/MANO profile must not be applied directly to MobRecon
+output; refit and independently validate a separate profile from MobRecon
+results.
 
 ## Outputs
 
@@ -238,17 +397,22 @@ All generated artifacts are written below `--base-dir`. Important directories
 include:
 
 ```text
-rectified_for_hamer/          rectified image cache and calibration metadata
+rectified_for_hamer/          shared rectified cache (historical compatibility name)
 sam3_bboxes/                  masks, boxes, and optional debug images
 sam3_tracks_stabilized/       temporally stabilized identities
 hamer_jobs/                   per-camera HaMeR work items
 hamer_per_view/               raw per-view predictions
 hamer_palm_local_fused/       default zero-shot fused hand-local result
 hamer_mano_multiview_refined/ optional image-space refinement result
+sam3_mobrecon_realtime/       default MobRecon output root
+  sam3_keyframes/             sparse SAM3 detections
+  realtime_cpu/               MobRecon per-view and online fused results
 ```
 
-The default deployment-oriented output is `hamer_palm_local_fused/`. Per-view
-predictions remain available for auditing and alternative fusion experiments.
+The default HaMeR deployment-oriented output is `hamer_palm_local_fused/`.
+For MobRecon, `outputs.fused` in
+`sam3_mobrecon_realtime/realtime_config_*.json` records the final path; raw and
+One-Euro results are both preserved.
 
 ## Portable dependencies
 
@@ -270,7 +434,9 @@ export MOBRECON_ROOT=/path/to/HandMesh
 export CONDA_BIN=/path/to/conda
 export HEADCAM_ENV=headcam
 export HAMER_ENV=hamer
+export MOBRECON_ENV=hamer
 export SAM3_ENV=sam3hand
+export HEADCAM_PIPELINE=hamer
 ```
 
 Explicit command-line paths take precedence where available.
