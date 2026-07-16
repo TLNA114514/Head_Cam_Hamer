@@ -50,6 +50,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bone-calibration-min-observations", type=int, default=25)
     parser.add_argument("--temporal-radius", type=int, default=0, help="Offline Gaussian smoothing radius in frames; zero disables it.")
     parser.add_argument("--temporal-sigma", type=float, default=4.0)
+    parser.add_argument(
+        "--temporal-interpolation-max-gap",
+        type=int,
+        default=2,
+        help="Fill bounded offline gaps up to this many frames; zero disables interpolation.",
+    )
+    parser.add_argument("--temporal-interpolation-max-joint-displacement-m", type=float, default=0.12)
+    parser.add_argument("--temporal-interpolation-max-bone-relative-change", type=float, default=0.20)
     parser.add_argument("--causal-ema-alpha", type=float, default=0.0, help="Causal EMA alpha; zero disables it.")
     parser.add_argument("--one-euro-min-cutoff", type=float, default=0.0, help="One Euro minimum cutoff in Hz; zero disables it.")
     parser.add_argument("--one-euro-beta", type=float, default=0.0, help="One Euro speed coefficient.")
@@ -276,6 +284,93 @@ def fuse_views(
     }
 
 
+def interpolate_short_gaps(
+    fused_by_key: dict[tuple[int, str], dict[str, Any]],
+    selected: dict[tuple[int, str], list[dict[str, Any]]],
+    allowed_group_ids: set[int] | None,
+    max_gap: int,
+    max_joint_displacement_m: float,
+    max_bone_relative_change: float,
+) -> tuple[dict[tuple[int, str], dict[str, Any]], dict[str, int]]:
+    if max_gap <= 0:
+        return {}, {}
+
+    interpolated: dict[tuple[int, str], dict[str, Any]] = {}
+    stats: dict[str, int] = defaultdict(int)
+    for handedness in ("Left", "Right"):
+        observed_groups = sorted(group_id for group_id, hand in fused_by_key if hand == handedness)
+        for previous_group_id, next_group_id in zip(observed_groups, observed_groups[1:]):
+            gap_size = next_group_id - previous_group_id - 1
+            if gap_size < 1 or gap_size > max_gap:
+                continue
+            stats["candidate_gaps"] += 1
+            missing_group_ids = list(range(previous_group_id + 1, next_group_id))
+            if allowed_group_ids is not None and any(group_id not in allowed_group_ids for group_id in missing_group_ids):
+                stats["rejected_not_requested"] += 1
+                continue
+
+            previous = fused_by_key[(previous_group_id, handedness)]
+            following = fused_by_key[(next_group_id, handedness)]
+            joint_displacements = np.linalg.norm(following["raw_joints"] - previous["raw_joints"], axis=1)
+            endpoint_max_joint_displacement_m = float(np.max(joint_displacements))
+            if endpoint_max_joint_displacement_m > max_joint_displacement_m:
+                stats["rejected_joint_displacement"] += 1
+                continue
+
+            previous_bones = bone_lengths(previous["raw_joints"])
+            following_bones = bone_lengths(following["raw_joints"])
+            bone_denominator = np.maximum(0.5 * (previous_bones + following_bones), 1e-8)
+            endpoint_max_bone_relative_change = float(
+                np.max(np.abs(following_bones - previous_bones) / bone_denominator)
+            )
+            if endpoint_max_bone_relative_change > max_bone_relative_change:
+                stats["rejected_bone_change"] += 1
+                continue
+
+            previous_vertices = previous.get("vertices")
+            following_vertices = following.get("vertices")
+            can_interpolate_vertices = (
+                isinstance(previous_vertices, np.ndarray)
+                and isinstance(following_vertices, np.ndarray)
+                and previous_vertices.shape == following_vertices.shape
+            )
+            for group_id in missing_group_ids:
+                alpha = (group_id - previous_group_id) / float(next_group_id - previous_group_id)
+                interpolated[(group_id, handedness)] = {
+                    "raw_joints": (1.0 - alpha) * previous["raw_joints"] + alpha * following["raw_joints"],
+                    "static_joints": (1.0 - alpha) * previous["static_joints"] + alpha * following["static_joints"],
+                    "vertices": (
+                        (1.0 - alpha) * previous_vertices + alpha * following_vertices
+                        if can_interpolate_vertices
+                        else None
+                    ),
+                    "previous_group_id": previous_group_id,
+                    "next_group_id": next_group_id,
+                    "gap_size": gap_size,
+                    "alpha": float(alpha),
+                    "endpoint_max_joint_displacement_m": endpoint_max_joint_displacement_m,
+                    "endpoint_max_bone_relative_change": endpoint_max_bone_relative_change,
+                    "endpoint_view_counts": [
+                        len(selected[(previous_group_id, handedness)]),
+                        len(selected[(next_group_id, handedness)]),
+                    ],
+                    "endpoint_used_cameras": [
+                        [item["camera_id"] for item in selected[(previous_group_id, handedness)]],
+                        [item["camera_id"] for item in selected[(next_group_id, handedness)]],
+                    ],
+                    "source_models": sorted(
+                        {
+                            item["model_name"]
+                            for endpoint_group_id in (previous_group_id, next_group_id)
+                            for item in selected[(endpoint_group_id, handedness)]
+                        }
+                    ),
+                }
+                stats["interpolated_hands"] += 1
+            stats["filled_gaps"] += 1
+    return interpolated, dict(stats)
+
+
 def gaussian_smooth(
     sequence: dict[tuple[int, str], np.ndarray], radius: int, sigma: float
 ) -> dict[tuple[int, str], np.ndarray]:
@@ -409,6 +504,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--temporal-radius must be non-negative")
     if args.temporal_radius > 0 and args.temporal_sigma <= 0.0:
         raise SystemExit("--temporal-sigma must be positive when smoothing is enabled")
+    if args.temporal_interpolation_max_gap < 0:
+        raise SystemExit("--temporal-interpolation-max-gap must be non-negative")
+    if args.temporal_interpolation_max_joint_displacement_m <= 0.0:
+        raise SystemExit("--temporal-interpolation-max-joint-displacement-m must be positive")
+    if args.temporal_interpolation_max_bone_relative_change <= 0.0:
+        raise SystemExit("--temporal-interpolation-max-bone-relative-change must be positive")
     if not 0.0 <= args.causal_ema_alpha <= 1.0:
         raise SystemExit("--causal-ema-alpha must be in [0, 1]")
     if args.one_euro_min_cutoff < 0.0 or args.one_euro_beta < 0.0:
@@ -448,7 +549,16 @@ def main() -> None:
         key: fuse_views(items, static_bone_lengths.get(key[1]), args.bone_calibration_blend, args.include_vertices)
         for key, items in selected.items()
     }
+    interpolated_by_key, interpolation_stats = interpolate_short_gaps(
+        fused_by_key,
+        selected,
+        group_ids,
+        args.temporal_interpolation_max_gap,
+        args.temporal_interpolation_max_joint_displacement_m,
+        args.temporal_interpolation_max_bone_relative_change,
+    )
     static_sequence = {key: fused["static_joints"] for key, fused in fused_by_key.items()}
+    static_sequence.update({key: item["static_joints"] for key, item in interpolated_by_key.items()})
     smoothed = gaussian_smooth(static_sequence, args.temporal_radius, args.temporal_sigma)
     causal = causal_ema(static_sequence, args.causal_ema_alpha)
     adaptive_causal = one_euro_smooth(
@@ -462,12 +572,80 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     stats: dict[str, int] = defaultdict(int)
     with output_path.open("w", encoding="utf-8") as output_file:
-        group_order = sorted({group_id for group_id, _handedness in selected})
+        group_order = sorted(
+            {group_id for group_id, _handedness in selected}
+            | {group_id for group_id, _handedness in interpolated_by_key}
+        )
         for group_id in tqdm(group_order, desc="palm-local fusion", unit="frame", position=args.progress_position):
             hands = []
             for handedness in ("Left", "Right"):
                 key = (group_id, handedness)
-                if key not in selected:
+                if key not in selected and key not in interpolated_by_key:
+                    continue
+                if key in interpolated_by_key:
+                    interpolation = interpolated_by_key[key]
+                    primary_joints, base_primary_source = choose_primary_joints(
+                        key, interpolation, smoothed, causal, adaptive_causal, args
+                    )
+                    primary_source = f"temporal-interpolated:{base_primary_source}"
+                    hand = {
+                        "group_id": group_id,
+                        "handedness": handedness,
+                        "mode": f"zero_shot_{primary_source}",
+                        "metric_valid": False,
+                        "local_shape_valid": True,
+                        "temporal_interpolated": True,
+                        "fusion_view_count": 0,
+                        "used_cameras": [],
+                        "source_models": interpolation["source_models"],
+                        "palm_local_joints_m": primary_joints.tolist(),
+                        "raw_palm_local_joints_m": None,
+                        "static_calibrated_palm_local_joints_m": None,
+                        "temporal_interpolated_raw_palm_local_joints_m": interpolation["raw_joints"].tolist(),
+                        "temporal_interpolated_static_palm_local_joints_m": interpolation["static_joints"].tolist(),
+                        "smoothed_palm_local_joints_m": smoothed[key].tolist() if key in smoothed else None,
+                        "causal_smoothed_palm_local_joints_m": causal[key].tolist() if key in causal else None,
+                        "adaptive_causal_palm_local_joints_m": (
+                            adaptive_causal[key].tolist() if key in adaptive_causal else None
+                        ),
+                        "palm_local_vertices_m": (
+                            interpolation["vertices"].tolist() if interpolation["vertices"] is not None else None
+                        ),
+                        "joint_consensus_std_m": None,
+                        "mean_consensus_error_m": None,
+                        "p95_consensus_error_m": None,
+                        "per_camera_consensus_error_m": {},
+                        "per_camera_quality_scores": {},
+                        "per_camera_quality_parts": {},
+                        "interpolation_previous_group_id": interpolation["previous_group_id"],
+                        "interpolation_next_group_id": interpolation["next_group_id"],
+                        "interpolation_gap_size": interpolation["gap_size"],
+                        "interpolation_alpha": interpolation["alpha"],
+                        "interpolation_endpoint_view_counts": interpolation["endpoint_view_counts"],
+                        "interpolation_endpoint_used_cameras": interpolation["endpoint_used_cameras"],
+                        "interpolation_endpoint_max_joint_displacement_m": interpolation[
+                            "endpoint_max_joint_displacement_m"
+                        ],
+                        "interpolation_endpoint_max_bone_relative_change": interpolation[
+                            "endpoint_max_bone_relative_change"
+                        ],
+                        "bone_calibration_blend": args.bone_calibration_blend,
+                        "temporal_radius": args.temporal_radius,
+                        "temporal_sigma": args.temporal_sigma if args.temporal_radius > 0 else None,
+                        "causal_ema_alpha": args.causal_ema_alpha if args.causal_ema_alpha > 0 else None,
+                        "one_euro_min_cutoff": args.one_euro_min_cutoff if args.one_euro_min_cutoff > 0 else None,
+                        "one_euro_beta": args.one_euro_beta if args.one_euro_min_cutoff > 0 else None,
+                        "one_euro_derivative_cutoff": (
+                            args.one_euro_derivative_cutoff if args.one_euro_min_cutoff > 0 else None
+                        ),
+                        "frame_rate": args.frame_rate if args.one_euro_min_cutoff > 0 else None,
+                        "primary_output_source": primary_source,
+                    }
+                    hands.append(hand)
+                    stats["hands"] += 1
+                    stats["temporal_interpolated_hands"] += 1
+                    stats["view_count:0"] += 1
+                    stats[f"primary_output:{primary_source}"] += 1
                     continue
                 items = selected[key]
                 fused = fused_by_key[key]
@@ -480,6 +658,7 @@ def main() -> None:
                     "mode": f"zero_shot_multiview_mean:{primary_source}",
                     "metric_valid": len(items) >= 2,
                     "local_shape_valid": True,
+                    "temporal_interpolated": False,
                     "fusion_view_count": len(items),
                     "used_cameras": [item["camera_id"] for item in items],
                     "source_models": sorted({item["model_name"] for item in items}),
@@ -526,6 +705,9 @@ def main() -> None:
             )
             stats["frames"] += 1
 
+    for key, value in interpolation_stats.items():
+        stats[f"interpolation:{key}"] = value
+
     config = {
         "predictions": [str(path) for path in paths],
         "output_path": str(output_path),
@@ -540,6 +722,10 @@ def main() -> None:
         },
         "temporal_radius": args.temporal_radius,
         "temporal_sigma": args.temporal_sigma,
+        "temporal_interpolation_max_gap": args.temporal_interpolation_max_gap,
+        "temporal_interpolation_max_joint_displacement_m": args.temporal_interpolation_max_joint_displacement_m,
+        "temporal_interpolation_max_bone_relative_change": args.temporal_interpolation_max_bone_relative_change,
+        "temporal_interpolation_stats": interpolation_stats,
         "causal_ema_alpha": args.causal_ema_alpha,
         "one_euro_min_cutoff": args.one_euro_min_cutoff,
         "one_euro_beta": args.one_euro_beta,

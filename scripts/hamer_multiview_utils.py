@@ -19,6 +19,7 @@ DEFAULT_IMAGE_ROOT = Path("video/cameras_left_index")
 DEFAULT_FRAMES = Path("video/cameras_left_index/frames.jsonl")
 DEFAULT_CALIB = Path("video/cameras_left_index/cameras.yaml")
 DEFAULT_CAMERAS = ("C0", "C1", "C2", "C3")
+DEFAULT_RECTIFY_FOCAL_SCALE = 0.7
 IMAGE_SIZE = (1600, 1200)
 PRIMARY_CAMERAS = {"Left": "C1", "Right": "C2"}
 BACKUP_PRIMARY_CAMERAS = {"Left": "C0", "Right": "C3"}
@@ -35,6 +36,11 @@ HAND_CONNECTIONS = (
 class RectifyCalibration:
     camera_id: str
     image_size: tuple[int, int]
+    camera_model: str
+    projection_model: str
+    distortion_model: str
+    rectify_backend: str
+    rectify_focal_scale: float
     map_x: np.ndarray
     map_y: np.ndarray
     new_k: np.ndarray
@@ -123,34 +129,109 @@ def filter_frame_records(
 def build_rectify_calibrations(
     calib_path: Path,
     cameras: set[str],
-    rectify_focal_scale: float = 0.30,
+    rectify_focal_scale: float | None = DEFAULT_RECTIFY_FOCAL_SCALE,
 ) -> dict[str, RectifyCalibration]:
     with calib_path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
-    default_size = tuple(int(v) for v in data["camera_defaults"]["image_size"])
+
+    if rectify_focal_scale is not None and rectify_focal_scale <= 0.0:
+        raise ValueError("--rectify-focal-scale must be positive")
+
+    defaults = data.get("camera_defaults") or {}
+    default_size = tuple(int(v) for v in defaults["image_size"])
+    if len(default_size) != 2:
+        raise ValueError(f"camera_defaults.image_size must be [width, height]: {default_size}")
+
     calibrations = {}
     for camera_id in sorted(cameras):
+        if camera_id not in data["cameras"]:
+            raise KeyError(f"Camera {camera_id!r} not found in {calib_path}")
         cam = data["cameras"][camera_id]
         image_size = tuple(int(v) for v in cam.get("image_size", default_size))
+        if len(image_size) != 2:
+            raise ValueError(f"{camera_id}.image_size must be [width, height]: {image_size}")
         k = np.asarray(cam["intrinsics"], dtype=np.float64)
-        d = np.asarray(cam["distortion"], dtype=np.float64).reshape(1, -1)
-        xi = np.asarray([[cam["xi"]]], dtype=np.float64)
+        if k.shape != (3, 3):
+            raise ValueError(f"{camera_id}.intrinsics must be a 3x3 matrix, got {k.shape}")
+        d = np.asarray(cam["distortion"], dtype=np.float64).reshape(-1)
+
+        inferred_omni = "xi" in cam
+        camera_model = str(
+            cam.get("camera_model", defaults.get("camera_model", "omni" if inferred_omni else "pinhole"))
+        ).strip().lower()
+        projection_model = str(
+            cam.get("projection_model", defaults.get("projection_model", "mei" if inferred_omni else "pinhole"))
+        ).strip().lower()
+        distortion_model = str(
+            cam.get("distortion_model", defaults.get("distortion_model", "radtan"))
+        ).strip().lower().replace("_", "-")
+
+        if camera_model in {"omni", "omnidir", "mei"} or projection_model in {"omni", "omnidir", "mei"}:
+            rectify_backend = "opencv-omnidir"
+        elif camera_model == "pinhole" and distortion_model in {"equidistant", "fisheye"}:
+            rectify_backend = "opencv-fisheye"
+        elif camera_model == "pinhole" and distortion_model in {
+            "radtan",
+            "radial-tangential",
+            "plumb-bob",
+            "opencv",
+        }:
+            rectify_backend = "opencv-pinhole"
+        else:
+            raise ValueError(
+                f"Unsupported camera model for {camera_id}: camera_model={camera_model!r}, "
+                f"projection_model={projection_model!r}, distortion_model={distortion_model!r}"
+            )
+
+        focal_scale = DEFAULT_RECTIFY_FOCAL_SCALE if rectify_focal_scale is None else rectify_focal_scale
         new_k = k.copy()
-        new_k[0, 0] *= rectify_focal_scale
-        new_k[1, 1] *= rectify_focal_scale
-        map_x, map_y = cv2.omnidir.initUndistortRectifyMap(
-            k,
-            d,
-            xi,
-            np.eye(3, dtype=np.float64),
-            new_k,
-            image_size,
-            cv2.CV_32FC1,
-            cv2.omnidir.RECTIFY_PERSPECTIVE,
-        )
+        new_k[0, 0] *= focal_scale
+        new_k[1, 1] *= focal_scale
+        identity = np.eye(3, dtype=np.float64)
+
+        if rectify_backend == "opencv-omnidir":
+            if "xi" not in cam:
+                raise ValueError(f"{camera_id} uses Omni/Mei projection but does not define xi")
+            xi = np.asarray([[cam["xi"]]], dtype=np.float64)
+            map_x, map_y = cv2.omnidir.initUndistortRectifyMap(
+                k,
+                d.reshape(1, -1),
+                xi,
+                identity,
+                new_k,
+                image_size,
+                cv2.CV_32FC1,
+                cv2.omnidir.RECTIFY_PERSPECTIVE,
+            )
+        elif rectify_backend == "opencv-fisheye":
+            if d.size != 4:
+                raise ValueError(f"{camera_id}.distortion must contain 4 equidistant coefficients, got {d.size}")
+            map_x, map_y = cv2.fisheye.initUndistortRectifyMap(
+                k,
+                d.reshape(4, 1),
+                identity,
+                new_k,
+                image_size,
+                cv2.CV_32FC1,
+            )
+        else:
+            map_x, map_y = cv2.initUndistortRectifyMap(
+                k,
+                d.reshape(-1, 1),
+                identity,
+                new_k,
+                image_size,
+                cv2.CV_32FC1,
+            )
+
         calibrations[camera_id] = RectifyCalibration(
             camera_id=camera_id,
             image_size=(int(image_size[0]), int(image_size[1])),
+            camera_model=camera_model,
+            projection_model=projection_model,
+            distortion_model=distortion_model,
+            rectify_backend=rectify_backend,
+            rectify_focal_scale=float(focal_scale),
             map_x=map_x,
             map_y=map_y,
             new_k=new_k,

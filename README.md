@@ -140,6 +140,19 @@ also requires `xi`. The convention used by this repository is:
 T_H_C maps a point from camera coordinates into the common headset frame H.
 ```
 
+Rectification is selected automatically from the model fields in
+`camera_defaults` (or a per-camera override):
+
+| Calibration fields | Rectification backend | `xi` | Default focal scale |
+| --- | --- | --- | ---: |
+| `camera_model: omni`, `projection_model: mei`, `distortion_model: radtan` | OpenCV `omnidir` | required | `0.7` |
+| `camera_model: pinhole`, `projection_model: pinhole`, `distortion_model: equidistant` | OpenCV `fisheye` | not used | `0.7` |
+
+The second path is the format used by `video/bad_failure/cameras.yaml`; do not
+add a synthetic `xi` or convert it to an Omni model. The global default for
+`--rectify-focal-scale` is `0.7`; pass another positive value only for a
+deliberate field-of-view experiment.
+
 The input root, metadata file, calibration file, and output directory are
 independent; none must use a repository-specific dataset name.
 
@@ -169,6 +182,7 @@ HaMeR quality/compatibility path:
   --frames /path/to/dataset/frames.jsonl \
   --calib /path/to/dataset/cameras.yaml \
   --base-dir outputs/my_run \
+  --rectify-focal-scale 0.7 \
   --cameras C0,C1,C2,C3 \
   --group-range 0-999 \
   --hamer-speed-profile quality \
@@ -185,6 +199,7 @@ The MobRecon low-latency path prepares or reuses the
   --frames /path/to/dataset/frames.jsonl \
   --calib /path/to/dataset/cameras.yaml \
   --base-dir outputs/my_realtime_run \
+  --rectify-focal-scale 0.7 \
   --cameras C0,C2,C3 \
   --group-range 0-999 \
   --keyframe-stride 10 \
@@ -209,8 +224,47 @@ form is usually enough:
 ./scripts/run.sh \
   --frames /path/to/dataset/frames.jsonl \
   --base-dir outputs/my_run \
+  --rectify-focal-scale 0.7 \
   --cameras C0,C1,C2,C3 \
   --group-range 0-999
+```
+
+### Run `video/bad_failure`
+
+The new calibration is detected as Pinhole/Equidistant automatically. The
+following full four-camera HaMeR quality example shows the `0.7` default
+explicitly:
+
+```bash
+./scripts/run.sh \
+  --pipeline hamer \
+  --image-root video/bad_failure \
+  --frames video/bad_failure/frames.jsonl \
+  --calib video/bad_failure/cameras.yaml \
+  --base-dir outputs/bad_failure_hamer \
+  --rectify-focal-scale 0.7 \
+  --cameras C0,C1,C2,C3 \
+  --group-range 0-619 \
+  --hamer-speed-profile quality
+```
+
+The corresponding MobRecon low-latency run is:
+
+```bash
+./scripts/run.sh \
+  --pipeline mobrecon \
+  --image-root video/bad_failure \
+  --frames video/bad_failure/frames.jsonl \
+  --calib video/bad_failure/cameras.yaml \
+  --base-dir outputs/bad_failure_mobrecon \
+  --rectify-focal-scale 0.7 \
+  --cameras C0,C1,C2,C3 \
+  --group-range 0-619 \
+  --keyframe-stride 10 \
+  --sam3-workers 2 \
+  --mobrecon-device cpu \
+  --mobrecon-precision float32 \
+  --mobrecon-torch-threads 8
 ```
 
 For gloved hands:
@@ -219,6 +273,7 @@ For gloved hands:
 ./scripts/run.sh \
   --frames /path/to/dataset/frames.jsonl \
   --base-dir outputs/gloved_run \
+  --rectify-focal-scale 0.7 \
   --cameras C0,C1,C2,C3 \
   --prompt-preset gloved \
   --group-range 0-999
@@ -233,6 +288,7 @@ Inspect the generated commands without running inference:
 ./scripts/run.sh \
   --frames /path/to/dataset/frames.jsonl \
   --base-dir outputs/test_run \
+  --rectify-focal-scale 0.7 \
   --cameras C0,C1 \
   --group-range 0-9 \
   --dry-run
@@ -296,7 +352,7 @@ into the HaMeR pipeline. Runnable does not mean recommended as a default:
 | --- | --- | --- |
 | HaMeR execution optimization | `--hamer-speed-profile quality|balanced|fast|aggressive` | Directly usable; `quality` is the default |
 | MobRecon realtime path | `--pipeline mobrecon` | Directly usable; CPU FP32 and stride 10 are the defaults |
-| Zero-shot raw, causal, and offline smoothing | `--zero-shot-primary-output ...` | Direct switch; the raw field is always preserved |
+| Zero-shot raw, bounded gap fill, causal, and offline smoothing | `--zero-shot-primary-output ...` | Raw observations stay untouched; missing runs of at most 2 frames are interpolated as non-metric fallbacks |
 | Physical-PnP plus 0.04m view gate | `--run-mano-multiview-image-refine` | Optional image-side MANO refinement; HaMeR only |
 | Static glove similarity plus joint offsets | `calibrate_hamer_to_glove_local.py` | Conservative default when a synchronized glove calibration clip exists |
 | Ridge/local-KNN plus OOD residual | `calibrate_pose_residual_local.py` | Directly usable; KNN requires dense target-pose coverage |
@@ -335,6 +391,21 @@ Fixed EMA uses `causal-smoothed` and a positive
 length normalization that **does not read glove ground truth**; it requires a
 positive `--zero-shot-bone-calibration-blend`. It is not the glove-supervised
 profile below.
+
+Offline fusion also fills isolated missing hands of at most two frames by
+default. A gap is filled only when the same handedness exists on both sides,
+the endpoint joint displacement is at most `0.12 m`, and endpoint bone lengths
+change by at most `20%`. Filled hands keep `metric_valid: false`, set
+`temporal_interpolated: true`, and do not fabricate a raw observation. Control
+or disable this behavior with:
+
+```text
+--zero-shot-temporal-interpolation-max-gap 2
+--zero-shot-temporal-interpolation-max-joint-displacement-m 0.12
+--zero-shot-temporal-interpolation-max-bone-relative-change 0.20
+```
+
+Set the maximum gap to `0` for strict raw-result reproduction.
 
 ### Fit and apply a glove calibration profile
 
@@ -437,6 +508,13 @@ export HAMER_ENV=hamer
 export MOBRECON_ENV=hamer
 export SAM3_ENV=sam3hand
 export HEADCAM_PIPELINE=hamer
+```
+
+For a single run, `--wrist-cam-root` is equivalent to temporarily setting
+`WRIST_CAM_ROOT` and applies to both preflight checks and the selected pipeline:
+
+```bash
+./scripts/run.sh --wrist-cam-root /path/to/wrist_cam [pipeline options]
 ```
 
 Explicit command-line paths take precedence where available.

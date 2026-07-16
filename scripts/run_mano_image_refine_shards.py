@@ -10,7 +10,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-from hamer_multiview_utils import DEFAULT_CAMERAS, parse_cameras, parse_group_ids, range_suffix
+from hamer_multiview_utils import (
+    DEFAULT_CAMERAS,
+    DEFAULT_RECTIFY_FOCAL_SCALE,
+    parse_cameras,
+    parse_group_ids,
+    range_suffix,
+)
 from progress_utils import tqdm
 
 
@@ -31,7 +37,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hamer-root", type=Path, default=DEFAULT_HAMER_ROOT)
     parser.add_argument("--calib", type=Path, required=True)
     parser.add_argument("--rectified-config", type=Path, required=True)
-    parser.add_argument("--rectify-focal-scale", type=float, default=0.30)
+    parser.add_argument(
+        "--rectify-focal-scale",
+        type=float,
+        default=DEFAULT_RECTIFY_FOCAL_SCALE,
+        help=f"Rectification focal scale (default: {DEFAULT_RECTIFY_FOCAL_SCALE:g}).",
+    )
     parser.add_argument("--pnp-view-gate-m", type=float, default=0.04)
     parser.add_argument("--min-readable-sam3-mask-ratio", type=float, default=0.50)
     parser.add_argument("--window-size", type=int, default=7)
@@ -143,8 +154,11 @@ def refine_command(
             str(args.calib),
             "--rectified-config",
             str(args.rectified_config),
-            "--rectify-focal-scale",
-            str(args.rectify_focal_scale),
+            *(
+                ["--rectify-focal-scale", str(args.rectify_focal_scale)]
+                if args.rectify_focal_scale is not None
+                else []
+            ),
             "--min-readable-sam3-mask-ratio",
             str(args.min_readable_sam3_mask_ratio),
             "--use-mediapipe-2d",

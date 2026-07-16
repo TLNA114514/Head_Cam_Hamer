@@ -16,6 +16,7 @@ from hamer_multiview_utils import (
     DEFAULT_CAMERAS,
     DEFAULT_FRAMES,
     DEFAULT_IMAGE_ROOT,
+    DEFAULT_RECTIFY_FOCAL_SCALE,
     build_rectify_calibrations,
     filter_frame_records,
     parse_cameras,
@@ -33,7 +34,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calib", type=Path, default=DEFAULT_CALIB)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_BASE_DIR / "rectified_for_hamer")
     parser.add_argument("--cameras", default=",".join(DEFAULT_CAMERAS))
-    parser.add_argument("--rectify-focal-scale", type=float, default=0.30)
+    parser.add_argument(
+        "--rectify-focal-scale",
+        type=float,
+        default=DEFAULT_RECTIFY_FOCAL_SCALE,
+        help=f"Rectification focal scale (default: {DEFAULT_RECTIFY_FOCAL_SCALE:g}).",
+    )
     parser.add_argument("--group-range", help="Inclusive group range, e.g. 1-100. Commas allowed.")
     parser.add_argument("--group-ids", help="Comma-separated explicit group ids.")
     parser.add_argument("--overwrite", action="store_true")
@@ -81,13 +87,28 @@ def main() -> None:
         cv2.imwrite(str(dst), rectified)
         written += 1
 
+    focal_scales = {
+        camera_id: calib.rectify_focal_scale for camera_id, calib in calibrations.items()
+    }
+    unique_focal_scales = set(focal_scales.values())
     config = {
         "image_root": str(args.image_root),
         "frames": str(args.frames),
         "calib": str(args.calib),
         "output_dir": str(args.output_dir),
         "cameras": sorted(cameras),
-        "rectify_focal_scale": args.rectify_focal_scale,
+        "rectify_focal_scale": next(iter(unique_focal_scales)) if len(unique_focal_scales) == 1 else None,
+        "rectify_focal_scale_requested": args.rectify_focal_scale,
+        "rectify_focal_scales": focal_scales,
+        "camera_models": {
+            camera_id: {
+                "camera_model": calib.camera_model,
+                "projection_model": calib.projection_model,
+                "distortion_model": calib.distortion_model,
+                "rectify_backend": calib.rectify_backend,
+            }
+            for camera_id, calib in calibrations.items()
+        },
         "group_range": args.group_range,
         "group_ids": args.group_ids,
         "range_suffix": suffix,
@@ -107,6 +128,11 @@ def main() -> None:
     print(f"  written: {written}")
     print(f"  skipped: {skipped}")
     print(f"  missing: {missing}")
+    for camera_id, calib in calibrations.items():
+        print(
+            f"  {camera_id}: backend={calib.rectify_backend} "
+            f"focal_scale={calib.rectify_focal_scale:g}"
+        )
     print(f"  output_dir: {args.output_dir}")
 
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -25,6 +26,9 @@ DATASET_PRESETS = {
         "calib": Path("video/cameras_right_index/cameras.yaml"),
     },
 }
+
+
+RANGED_FILE_RE = re.compile(r"^(?P<prefix>.+)_(?P<start>\d{6})_(?P<end>\d{6})\.jsonl$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,23 +69,42 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_ranged_path(directory: Path, prefix: str, group_ids: set[int] | None) -> Path:
+    suffix = range_suffix(group_ids)
+    exact = directory / f"{prefix}_{suffix}.jsonl"
+    if exact.exists():
+        return exact
+
+    requested_start = min(group_ids) if group_ids else None
+    requested_end = max(group_ids) if group_ids else None
+    covering = []
+    for candidate in sorted(directory.glob(f"{prefix}_*.jsonl")):
+        match = RANGED_FILE_RE.match(candidate.name)
+        if match is None or match.group("prefix") != prefix:
+            continue
+        start = int(match.group("start"))
+        end = int(match.group("end"))
+        if requested_start is not None and (start > requested_start or end < requested_end):
+            continue
+        covering.append((end - start, start, end, candidate))
+    if covering:
+        return min(covering)[3] if group_ids else max(covering)[3]
+    return exact
+
+
 def default_triangulated_path(base_dir: Path, group_range: str | None, group_ids: str | None) -> Path:
-    suffix = range_suffix(parse_group_ids(group_range, group_ids))
-    selected = base_dir / "hamer_mano_multiview_selected" / f"mano_multiview_local_hands_{suffix}.jsonl"
-    if selected.exists():
-        return selected
-    soft_refined = base_dir / "hamer_mano_multiview_soft_refined" / f"mano_multiview_local_hands_{suffix}.jsonl"
-    if soft_refined.exists():
-        return soft_refined
-    image_refined = base_dir / "hamer_mano_multiview_refined" / f"mano_multiview_local_hands_{suffix}.jsonl"
-    if image_refined.exists():
-        return image_refined
-    refined = base_dir / "hamer_mano_local_refined" / f"mano_local_hands_{suffix}.jsonl"
-    if refined.exists():
-        return refined
-    ranged = base_dir / "hamer_primary_local" / f"hamer_local_hands_{suffix}.jsonl"
-    if ranged.exists():
-        return ranged
+    selected_group_ids = parse_group_ids(group_range, group_ids)
+    candidates = (
+        ("hamer_mano_multiview_selected", "mano_multiview_local_hands"),
+        ("hamer_mano_multiview_soft_refined", "mano_multiview_local_hands"),
+        ("hamer_mano_multiview_refined", "mano_multiview_local_hands"),
+        ("hamer_mano_local_refined", "mano_local_hands"),
+        ("hamer_primary_local", "hamer_local_hands"),
+    )
+    for directory_name, prefix in candidates:
+        candidate = resolve_ranged_path(base_dir / directory_name, prefix, selected_group_ids)
+        if candidate.exists():
+            return candidate
     return base_dir / "hamer_primary_local" / "hamer_local_hands.jsonl"
 
 
@@ -122,15 +145,23 @@ def main() -> None:
         args.render_mode = "skeleton"
         args.no_mediapipe_overlay = True
         args.no_camera_rig = True
+    selected_group_ids = parse_group_ids(args.group_range, args.group_ids)
     if args.zero_shot:
-        suffix = range_suffix(parse_group_ids(args.group_range, args.group_ids))
-        args.triangulated = args.base_dir / "hamer_palm_local_fused" / f"palm_local_hands_{suffix}.jsonl"
+        args.triangulated = resolve_ranged_path(
+            args.base_dir / "hamer_palm_local_fused",
+            "palm_local_hands",
+            selected_group_ids,
+        )
         args.render_mode = "skeleton"
 
     viewer = Path(__file__).resolve().parent / "view_triangulated_hands_rgb.py"
     triangulated = args.triangulated or default_triangulated_path(args.base_dir, args.group_range, args.group_ids)
     detections = args.detections or (args.base_dir / "landmarks.jsonl")
-    hamer_predictions = args.hamer_predictions or (args.base_dir / "hamer_per_view" / f"hamer_predictions_{range_suffix(parse_group_ids(args.group_range, args.group_ids))}.jsonl")
+    hamer_predictions = args.hamer_predictions or resolve_ranged_path(
+        args.base_dir / "hamer_per_view",
+        "hamer_predictions",
+        selected_group_ids,
+    )
 
     command = [
         sys.executable,

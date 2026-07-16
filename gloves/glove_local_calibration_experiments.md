@@ -645,7 +645,8 @@ path with that constraint:
 2. Use image quality only to choose between duplicate hypotheses from the same
    camera.
 3. Give the selected cameras equal weight and average corresponding joints.
-4. Preserve that result in `raw_palm_local_joints_m` unconditionally.
+4. Preserve every observed result in `raw_palm_local_joints_m`; interpolated
+   gap records leave the raw field empty.
 5. Store static shape calibration, causal EMA, and offline Gaussian smoothing
    in separate fields; none of them overwrite the raw result unless explicitly
    selected with `--primary-output`.
@@ -654,7 +655,9 @@ The generated config writes `uses_ground_truth: false`,
 `cross_view_weighting: equal`, and the exact output-field choice. The main
 pipeline runs this stage by default, but keeps `--zero-shot-primary-output raw`,
 zero bone calibration, and zero temporal smoothing as the deployment-safe
-defaults.
+defaults. The current deployment pipeline additionally enables bounded
+two-frame gap interpolation; set it to zero to reproduce the historical
+experiments in this section.
 
 ### Why Equal View Weights
 
@@ -745,6 +748,7 @@ conda run --no-capture-output -n headcam python scripts/fuse_hamer_palm_local.py
   --group-range 0-442 \
   --temporal-radius 10 \
   --temporal-sigma 4 \
+  --temporal-interpolation-max-gap 0 \
   --causal-ema-alpha 0.20 \
   --one-euro-min-cutoff 0.2 \
   --one-euro-beta 5.0 \

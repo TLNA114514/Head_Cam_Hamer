@@ -16,7 +16,16 @@ from pathlib import Path
 from queue import Queue
 from threading import Lock
 
-from hamer_multiview_utils import DEFAULT_BASE_DIR, DEFAULT_CAMERAS, DEFAULT_FRAMES, iter_jsonl, parse_cameras, parse_group_ids, range_suffix
+from hamer_multiview_utils import (
+    DEFAULT_BASE_DIR,
+    DEFAULT_CAMERAS,
+    DEFAULT_FRAMES,
+    DEFAULT_RECTIFY_FOCAL_SCALE,
+    iter_jsonl,
+    parse_cameras,
+    parse_group_ids,
+    range_suffix,
+)
 from progress_utils import tqdm
 
 
@@ -46,7 +55,12 @@ def parse_args() -> argparse.Namespace:
         help="Camera calibration YAML. Defaults to cameras.yaml beside frames.jsonl.",
     )
     parser.add_argument("--mediapipe", type=Path, help="MediaPipe landmarks JSONL. Defaults to base-dir/landmarks.jsonl.")
-    parser.add_argument("--rectify-focal-scale", type=float, default=0.30)
+    parser.add_argument(
+        "--rectify-focal-scale",
+        type=float,
+        default=DEFAULT_RECTIFY_FOCAL_SCALE,
+        help=f"Rectification focal scale (default: {DEFAULT_RECTIFY_FOCAL_SCALE:g}).",
+    )
     parser.add_argument("--group-range")
     parser.add_argument("--range", dest="range_alias", help="Short alias for --group-range.")
     parser.add_argument("--group-ids")
@@ -166,6 +180,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zero-shot-bone-calibration-blend", type=float, default=0.0)
     parser.add_argument("--zero-shot-temporal-radius", type=int, default=0)
     parser.add_argument("--zero-shot-temporal-sigma", type=float, default=4.0)
+    parser.add_argument("--zero-shot-temporal-interpolation-max-gap", type=int, default=2)
+    parser.add_argument("--zero-shot-temporal-interpolation-max-joint-displacement-m", type=float, default=0.12)
+    parser.add_argument("--zero-shot-temporal-interpolation-max-bone-relative-change", type=float, default=0.20)
     parser.add_argument("--zero-shot-causal-ema-alpha", type=float, default=0.0)
     parser.add_argument("--zero-shot-one-euro-min-cutoff", type=float, default=0.2)
     parser.add_argument("--zero-shot-one-euro-beta", type=float, default=5.0)
@@ -508,6 +525,8 @@ def expanded_chunk_ids(chunk_ids: list[int], selected_group_ids: list[int], over
 
 def main() -> None:
     args = parse_args()
+    if args.rectify_focal_scale is not None and args.rectify_focal_scale <= 0.0:
+        raise SystemExit("--rectify-focal-scale must be positive")
     if args.hamer_batch_size < 1 or args.hamer_job_batch_size < 1:
         raise SystemExit("--hamer-batch-size and --hamer-job-batch-size must be positive")
     profile_defaults = {
@@ -537,6 +556,12 @@ def main() -> None:
         raise SystemExit("--zero-shot-temporal-radius must be non-negative")
     if args.zero_shot_temporal_radius > 0 and args.zero_shot_temporal_sigma <= 0.0:
         raise SystemExit("--zero-shot-temporal-sigma must be positive when smoothing is enabled")
+    if args.zero_shot_temporal_interpolation_max_gap < 0:
+        raise SystemExit("--zero-shot-temporal-interpolation-max-gap must be non-negative")
+    if args.zero_shot_temporal_interpolation_max_joint_displacement_m <= 0.0:
+        raise SystemExit("--zero-shot-temporal-interpolation-max-joint-displacement-m must be positive")
+    if args.zero_shot_temporal_interpolation_max_bone_relative_change <= 0.0:
+        raise SystemExit("--zero-shot-temporal-interpolation-max-bone-relative-change must be positive")
     if not 0.0 <= args.zero_shot_causal_ema_alpha <= 1.0:
         raise SystemExit("--zero-shot-causal-ema-alpha must be in [0, 1]")
     if args.zero_shot_one_euro_min_cutoff < 0.0 or args.zero_shot_one_euro_beta < 0.0:
@@ -611,8 +636,11 @@ def main() -> None:
         str(args.base_dir / "rectified_for_hamer"),
         "--cameras",
         ",".join(cameras),
-        "--rectify-focal-scale",
-        str(args.rectify_focal_scale),
+        *(
+            ["--rectify-focal-scale", str(args.rectify_focal_scale)]
+            if args.rectify_focal_scale is not None
+            else []
+        ),
         *common_range,
         *overwrite,
     ]
@@ -645,8 +673,11 @@ def main() -> None:
                             str(shard_dir),
                             "--cameras",
                             camera_id,
-                            "--rectify-focal-scale",
-                            str(args.rectify_focal_scale),
+                            *(
+                                ["--rectify-focal-scale", str(args.rectify_focal_scale)]
+                                if args.rectify_focal_scale is not None
+                                else []
+                            ),
                             *common_range,
                             *overwrite,
                         ],
@@ -989,6 +1020,12 @@ def main() -> None:
             str(args.zero_shot_temporal_radius),
             "--temporal-sigma",
             str(args.zero_shot_temporal_sigma),
+            "--temporal-interpolation-max-gap",
+            str(args.zero_shot_temporal_interpolation_max_gap),
+            "--temporal-interpolation-max-joint-displacement-m",
+            str(args.zero_shot_temporal_interpolation_max_joint_displacement_m),
+            "--temporal-interpolation-max-bone-relative-change",
+            str(args.zero_shot_temporal_interpolation_max_bone_relative_change),
             "--causal-ema-alpha",
             str(args.zero_shot_causal_ema_alpha),
             "--one-euro-min-cutoff",
@@ -1129,8 +1166,11 @@ def main() -> None:
             "--rectified-config",
             str(rectified_config_path),
             *(["--projection-correction", str(args.image_projection_correction)] if args.image_projection_correction else []),
-            "--rectify-focal-scale",
-            str(args.rectify_focal_scale),
+            *(
+                ["--rectify-focal-scale", str(args.rectify_focal_scale)]
+                if args.rectify_focal_scale is not None
+                else []
+            ),
             "--min-readable-sam3-mask-ratio",
             str(args.image_min_readable_sam3_mask_ratio),
             "--use-mediapipe-2d",

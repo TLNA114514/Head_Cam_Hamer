@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from hamer_multiview_utils import parse_cameras, parse_group_ids, range_suffix
+from hamer_multiview_utils import DEFAULT_RECTIFY_FOCAL_SCALE, parse_cameras, parse_group_ids, range_suffix
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -34,7 +34,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Camera calibration YAML. Defaults to cameras.yaml beside frames.jsonl.",
     )
-    parser.add_argument("--rectify-focal-scale", type=float, default=0.30)
+    parser.add_argument(
+        "--rectify-focal-scale",
+        type=float,
+        default=DEFAULT_RECTIFY_FOCAL_SCALE,
+        help=f"Rectification focal scale (default: {DEFAULT_RECTIFY_FOCAL_SCALE:g}).",
+    )
     parser.add_argument(
         "--prepare-rectified",
         action=argparse.BooleanOptionalAction,
@@ -213,7 +218,7 @@ def main() -> None:
         or args.one_euro_beta < 0.0
     ):
         raise SystemExit("stride, VRAM, and threads must be positive; One-Euro values must be non-negative")
-    if args.rectify_focal_scale <= 0.0:
+    if args.rectify_focal_scale is not None and args.rectify_focal_scale <= 0.0:
         raise SystemExit("--rectify-focal-scale must be positive")
     args.image_root = args.image_root or args.frames.parent
     args.calib = args.calib or (args.frames.parent / "cameras.yaml")
@@ -262,8 +267,11 @@ def main() -> None:
             str(rectified_dir),
             "--cameras",
             ",".join(cameras),
-            "--rectify-focal-scale",
-            str(args.rectify_focal_scale),
+            *(
+                ["--rectify-focal-scale", str(args.rectify_focal_scale)]
+                if args.rectify_focal_scale is not None
+                else []
+            ),
             *range_args(args),
             *(["--overwrite"] if args.overwrite else []),
         ]

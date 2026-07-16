@@ -16,6 +16,7 @@ from typing import Any, Iterable
 import cv2
 import numpy as np
 import yaml
+from hamer_multiview_utils import DEFAULT_RECTIFY_FOCAL_SCALE, build_rectify_calibrations
 from progress_utils import tqdm
 
 
@@ -40,9 +41,11 @@ RECTIFY_MODES = {
 class CameraCalibration:
     camera_id: str
     image_size: tuple[int, int]
-    k: np.ndarray
-    d: np.ndarray
-    xi: np.ndarray
+    camera_model: str
+    projection_model: str
+    distortion_model: str
+    rectify_backend: str
+    rectify_focal_scale: float
     new_k: np.ndarray
     map_x: np.ndarray
     map_y: np.ndarray
@@ -52,7 +55,7 @@ class CameraCalibration:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run MediaPipe Hands on omnidir-rectified synchronized camera images."
+        description="Run MediaPipe Hands on rectified synchronized camera images."
     )
     parser.add_argument("--input", default="video/cameras_left_index", type=Path, help="Camera image root.")
     parser.add_argument("--calib", default="video/cameras_left_index/cameras.yaml", type=Path, help="Camera YAML.")
@@ -79,11 +82,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress-position", default=int(os.environ.get("TQDM_POSITION", "0")), type=int, help="tqdm terminal row position.")
     parser.add_argument(
         "--rectify-focal-scale",
-        default=1.0,
+        default=DEFAULT_RECTIFY_FOCAL_SCALE,
         type=float,
         help=(
-            "Scale the virtual perspective focal length. Values below 1.0 show a wider "
-            "rectified view, with more black border and more perspective distortion."
+            f"Rectification focal scale (default: {DEFAULT_RECTIFY_FOCAL_SCALE:g}). "
+            "Values below 1.0 show a wider rectified view."
         ),
     )
     parser.add_argument(
@@ -169,51 +172,51 @@ def build_undistort_maps(
 def load_calibrations(
     calib_path: Path,
     camera_ids: set[str],
-    rectify_focal_scale: float,
+    rectify_focal_scale: float | None,
     write_full_view_debug: bool,
 ) -> dict[str, CameraCalibration]:
+    rectified = build_rectify_calibrations(calib_path, camera_ids, rectify_focal_scale)
+    if write_full_view_debug:
+        unsupported = [
+            camera_id
+            for camera_id, calib in rectified.items()
+            if calib.rectify_backend != "opencv-omnidir"
+        ]
+        if unsupported:
+            raise ValueError(
+                "--write-full-view-debug uses Omni/Mei longlat projection and is not "
+                f"available for: {','.join(unsupported)}"
+            )
+
     with calib_path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
-    if rectify_focal_scale <= 0.0:
-        raise ValueError("--rectify-focal-scale must be positive")
-
-    default_size = tuple(int(v) for v in data["camera_defaults"]["image_size"])
-    if len(default_size) != 2:
-        raise ValueError(f"camera_defaults.image_size must be [width, height]: {default_size}")
-
     calibrations: dict[str, CameraCalibration] = {}
     for camera_id in sorted(camera_ids):
-        if camera_id not in data["cameras"]:
-            raise KeyError(f"Camera {camera_id!r} not found in {calib_path}")
+        base = rectified[camera_id]
         cam = data["cameras"][camera_id]
-        image_size = tuple(int(v) for v in cam.get("image_size", default_size))
-        k = np.asarray(cam["intrinsics"], dtype=np.float64)
-        d = np.asarray(cam["distortion"], dtype=np.float64).reshape(1, -1)
-        xi = np.asarray([[cam["xi"]]], dtype=np.float64)
-        new_k = k.copy()
-        new_k[0, 0] *= rectify_focal_scale
-        new_k[1, 1] *= rectify_focal_scale
-        map_x, map_y = build_undistort_maps(
-            k, d, xi, new_k, image_size, RECTIFY_MODES["perspective"]
-        )
 
         full_view_map_x = None
         full_view_map_y = None
         if write_full_view_debug:
+            k = np.asarray(cam["intrinsics"], dtype=np.float64)
+            d = np.asarray(cam["distortion"], dtype=np.float64).reshape(1, -1)
+            xi = np.asarray([[cam["xi"]]], dtype=np.float64)
             full_view_map_x, full_view_map_y = build_undistort_maps(
-                k, d, xi, k.copy(), image_size, RECTIFY_MODES["longlat"]
+                k, d, xi, k.copy(), base.image_size, RECTIFY_MODES["longlat"]
             )
 
         calibrations[camera_id] = CameraCalibration(
             camera_id=camera_id,
-            image_size=(int(image_size[0]), int(image_size[1])),
-            k=k,
-            d=d,
-            xi=xi,
-            new_k=new_k,
-            map_x=map_x,
-            map_y=map_y,
+            image_size=base.image_size,
+            camera_model=base.camera_model,
+            projection_model=base.projection_model,
+            distortion_model=base.distortion_model,
+            rectify_backend=base.rectify_backend,
+            rectify_focal_scale=base.rectify_focal_scale,
+            new_k=base.new_k,
+            map_x=base.map_x,
+            map_y=base.map_y,
             full_view_map_x=full_view_map_x,
             full_view_map_y=full_view_map_y,
         )
@@ -474,7 +477,25 @@ def write_run_config(
         "frames": str(args.frames),
         "cameras": sorted(calibrations),
         "rectify_mode": "perspective",
-        "rectify_focal_scale": args.rectify_focal_scale,
+        "rectify_focal_scale": (
+            next(iter({calib.rectify_focal_scale for calib in calibrations.values()}))
+            if len({calib.rectify_focal_scale for calib in calibrations.values()}) == 1
+            else None
+        ),
+        "rectify_focal_scale_requested": args.rectify_focal_scale,
+        "rectify_focal_scales": {
+            camera_id: calib.rectify_focal_scale
+            for camera_id, calib in sorted(calibrations.items())
+        },
+        "camera_models": {
+            camera_id: {
+                "camera_model": calib.camera_model,
+                "projection_model": calib.projection_model,
+                "distortion_model": calib.distortion_model,
+                "rectify_backend": calib.rectify_backend,
+            }
+            for camera_id, calib in sorted(calibrations.items())
+        },
         "write_full_view_debug": bool(args.write_full_view_debug),
         "swap_handedness": bool(args.swap_handedness),
         "repair_duplicate_handedness": bool(args.repair_duplicate_handedness),

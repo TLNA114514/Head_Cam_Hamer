@@ -22,8 +22,10 @@ import yaml
 from hamer_multiview_utils import (
     DEFAULT_BASE_DIR,
     DEFAULT_CALIB,
+    DEFAULT_RECTIFY_FOCAL_SCALE,
     HAND_CONNECTIONS,
     PRIMARY_CAMERAS,
+    build_rectify_calibrations,
     iter_jsonl,
     load_mask,
     parse_group_ids,
@@ -68,7 +70,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calib", type=Path, default=DEFAULT_CALIB)
     parser.add_argument("--rectified-config", type=Path)
     parser.add_argument("--projection-correction", type=Path, help="Optional per-camera rectified-pixel affine correction JSON.")
-    parser.add_argument("--rectify-focal-scale", type=float, default=0.30)
+    parser.add_argument(
+        "--rectify-focal-scale",
+        type=float,
+        default=DEFAULT_RECTIFY_FOCAL_SCALE,
+        help=(
+            f"Rectification focal scale when no rectified config is available "
+            f"(default: {DEFAULT_RECTIFY_FOCAL_SCALE:g})."
+        ),
+    )
     parser.add_argument(
         "--global-initialization",
         choices=["hamer-virtual", "physical-pnp"],
@@ -324,20 +334,23 @@ def resolve_hamer_checkpoint(hamer_root: Path, checkpoint: str | None) -> Path:
     return path.resolve()
 
 
-def load_rectified_intrinsics(rectified_config: Path | None, calib_path: Path, rectify_focal_scale: float) -> dict[str, np.ndarray]:
+def load_rectified_intrinsics(
+    rectified_config: Path | None,
+    calib_path: Path,
+    rectify_focal_scale: float | None,
+) -> dict[str, np.ndarray]:
     if rectified_config and rectified_config.exists():
         with rectified_config.open("r", encoding="utf-8") as f:
             data = json.load(f)
         return {camera_id: np.asarray(k, dtype=np.float64) for camera_id, k in (data.get("new_intrinsics") or {}).items()}
     with calib_path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
-    out = {}
-    for camera_id, cam in data["cameras"].items():
-        k = np.asarray(cam["intrinsics"], dtype=np.float64).copy()
-        k[0, 0] *= rectify_focal_scale
-        k[1, 1] *= rectify_focal_scale
-        out[camera_id] = k
-    return out
+    calibrations = build_rectify_calibrations(
+        calib_path,
+        set(data["cameras"]),
+        rectify_focal_scale,
+    )
+    return {camera_id: calib.new_k for camera_id, calib in calibrations.items()}
 
 
 def load_camera_geometry(calib_path: Path, intrinsics: dict[str, np.ndarray]) -> dict[str, dict[str, np.ndarray]]:

@@ -23,6 +23,7 @@ SAM3_ENV="${SAM3_ENV:-sam3hand}"
 cd "${ROOT_DIR}"
 
 PIPELINE="${HEADCAM_PIPELINE:-hamer}"
+WRIST_CAM_ROOT_OVERRIDE=""
 FORWARD_ARGS=()
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -38,6 +39,22 @@ while [[ "$#" -gt 0 ]]; do
       PIPELINE="${1#*=}"
       shift
       ;;
+    --wrist-cam-root)
+      if [[ "$#" -lt 2 || -z "$2" ]]; then
+        echo "--wrist-cam-root requires a path" >&2
+        exit 2
+      fi
+      WRIST_CAM_ROOT_OVERRIDE="$2"
+      shift 2
+      ;;
+    --wrist-cam-root=*)
+      WRIST_CAM_ROOT_OVERRIDE="${1#*=}"
+      if [[ -z "${WRIST_CAM_ROOT_OVERRIDE}" ]]; then
+        echo "--wrist-cam-root requires a path" >&2
+        exit 2
+      fi
+      shift
+      ;;
     --list-pipelines)
       printf '%s\n' 'hamer' 'mobrecon'
       exit 0
@@ -48,6 +65,9 @@ while [[ "$#" -gt 0 ]]; do
       ;;
   esac
 done
+if [[ -n "${WRIST_CAM_ROOT_OVERRIDE}" ]]; then
+  export WRIST_CAM_ROOT="${WRIST_CAM_ROOT_OVERRIDE}"
+fi
 if [[ "${PIPELINE}" != "hamer" && "${PIPELINE}" != "mobrecon" ]]; then
   echo "Unknown pipeline: ${PIPELINE}. Expected hamer or mobrecon." >&2
   exit 2
@@ -72,8 +92,10 @@ if [[ "${SHOW_SELECTOR_HELP}" -eq 1 ]]; then
   cat <<EOF
 HeadCam pipeline selector:
   --pipeline hamer|mobrecon  Select the full pipeline (default: hamer).
+  --wrist-cam-root PATH      Override the wrist_cam checkout for this run.
   --list-pipelines           List available pipeline names.
   HEADCAM_PIPELINE           Environment default for --pipeline.
+  WRIST_CAM_ROOT             Environment equivalent of --wrist-cam-root.
 
 Selected pipeline: ${PIPELINE}
 Backend-specific options follow.
