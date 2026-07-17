@@ -78,7 +78,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hamer-conda-env", default="hamer")
     parser.add_argument("--sam3-root", type=Path, default=DEFAULT_SAM3_ROOT)
     parser.add_argument("--sam3-checkpoint", type=Path, help="Optional local SAM3 checkpoint. Prevents HuggingFace download when provided.")
-    parser.add_argument("--sam3-no-hf", action="store_true", help="Do not allow SAM3 to download checkpoints from HuggingFace.")
+    parser.add_argument(
+        "--sam3-no-hf",
+        action="store_true",
+        help="Disable Hugging Face loading; requires --sam3-checkpoint.",
+    )
     parser.add_argument("--sam3-hf-endpoint", default="https://hf-mirror.com", help="HF endpoint used by SAM3 downloads.")
     parser.add_argument("--sam3-version", choices=["sam3", "sam3.1"], default="sam3.1", help="SAM3 native video tracker version.")
     parser.add_argument(

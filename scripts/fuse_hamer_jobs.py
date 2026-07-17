@@ -205,6 +205,13 @@ def best_handedness_from_sam3(sam: dict[str, Any] | None) -> tuple[str | None, s
     handedness = sam.get("handedness")
     if handedness in {"Left", "Right"}:
         return handedness, sam.get("handedness_source") or "sam3", sam.get("handedness_confidence")
+    handedness_source = str(sam.get("handedness_source") or "")
+    is_right = sam.get("is_right")
+    if handedness_source in {"manual", "prompt", "prompt_cluster"} and is_right in {0, 1, False, True}:
+        confidence = sam.get("handedness_confidence")
+        if not isinstance(confidence, (int, float)):
+            confidence = sam.get("score")
+        return "Right" if bool(is_right) else "Left", handedness_source, confidence
     return None, None, None
 
 

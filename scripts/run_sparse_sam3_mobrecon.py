@@ -58,7 +58,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference-sam3", type=Path, help="Dense SAM3 JSONL used only for tracker evaluation.")
     parser.add_argument("--sam3-root", type=Path, default=DEFAULT_SAM3_ROOT)
     parser.add_argument("--sam3-checkpoint", type=Path)
-    parser.add_argument("--sam3-no-hf", action="store_true")
+    parser.add_argument(
+        "--sam3-prompt-preset",
+        choices=["bare", "gloved", "realtime"],
+        default="bare",
+        help="SAM3 prompt set. 'bare' is slower but supplies semantic left/right evidence.",
+    )
+    parser.add_argument(
+        "--sam3-duplicate-mask-containment",
+        type=float,
+        default=0.9,
+        help="Suppress nested duplicate SAM3 masks at this intersection/min(area) threshold; 0 disables it.",
+    )
+    parser.add_argument(
+        "--sam3-no-hf",
+        action="store_true",
+        help="Disable Hugging Face loading; requires --sam3-checkpoint.",
+    )
     parser.add_argument("--sam3-amp-dtype", choices=["float32", "bfloat16", "float16"], default="float16")
     parser.add_argument("--sam3-torch-threads", type=int, default=2)
     parser.add_argument("--conda-bin", default=default_conda_executable())
@@ -74,6 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mobrecon-torch-threads", type=int, default=8)
     parser.add_argument("--one-euro-min-cutoff", type=float, default=0.25)
     parser.add_argument("--one-euro-beta", type=float, default=0.05)
+    parser.add_argument("--handedness-switch-confirm-keyframes", type=int, default=2)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -216,8 +233,11 @@ def main() -> None:
         or args.mobrecon_torch_threads < 1
         or args.one_euro_min_cutoff < 0.0
         or args.one_euro_beta < 0.0
+        or args.handedness_switch_confirm_keyframes < 1
     ):
         raise SystemExit("stride, VRAM, and threads must be positive; One-Euro values must be non-negative")
+    if not 0.0 <= args.sam3_duplicate_mask_containment <= 1.0:
+        raise SystemExit("--sam3-duplicate-mask-containment must be in [0, 1]")
     if args.rectify_focal_scale is not None and args.rectify_focal_scale <= 0.0:
         raise SystemExit("--rectify-focal-scale must be positive")
     args.image_root = args.image_root or args.frames.parent
@@ -236,6 +256,8 @@ def main() -> None:
         raise SystemExit(f"SAM3 root not found: {args.sam3_root}")
     if args.sam3_checkpoint is not None and not args.sam3_checkpoint.is_file():
         raise SystemExit(f"SAM3 checkpoint not found: {args.sam3_checkpoint}")
+    if args.sam3_no_hf and args.sam3_checkpoint is None:
+        raise SystemExit("--sam3-no-hf requires --sam3-checkpoint; otherwise SAM3 has no pretrained weights")
     if not (args.mobrecon_root / "cmr" / "models" / "mobrecon_densestack.py").is_file():
         raise SystemExit(f"MobRecon root not found: {args.mobrecon_root}")
     if args.mobrecon_checkpoint is not None and not args.mobrecon_checkpoint.is_file():
@@ -307,7 +329,9 @@ def main() -> None:
                 "--frame-stride",
                 str(args.keyframe_stride),
                 "--prompt-preset",
-                "realtime",
+                args.sam3_prompt_preset,
+                "--duplicate-mask-containment",
+                str(args.sam3_duplicate_mask_containment),
                 "--amp-dtype",
                 args.sam3_amp_dtype,
                 "--torch-threads",
@@ -368,6 +392,8 @@ def main() -> None:
             str(args.one_euro_min_cutoff),
             "--one-euro-beta",
             str(args.one_euro_beta),
+            "--handedness-switch-confirm-keyframes",
+            str(args.handedness_switch_confirm_keyframes),
             "--microbatch-groups",
             "1",
             "--device",
@@ -420,12 +446,15 @@ def main() -> None:
             "prepare_rectified": args.prepare_rectified,
             "cameras": cameras,
             "keyframe_stride": args.keyframe_stride,
+            "sam3_prompt_preset": args.sam3_prompt_preset,
+            "sam3_duplicate_mask_containment": args.sam3_duplicate_mask_containment,
             "sam3_torch_threads": args.sam3_torch_threads,
             "mobrecon_torch_threads": args.mobrecon_torch_threads,
             "mobrecon_root": str(args.mobrecon_root),
             "mobrecon_checkpoint": str(args.mobrecon_checkpoint) if args.mobrecon_checkpoint else None,
             "one_euro_min_cutoff": args.one_euro_min_cutoff,
             "one_euro_beta": args.one_euro_beta,
+            "handedness_switch_confirm_keyframes": args.handedness_switch_confirm_keyframes,
             "mobrecon_precision": args.mobrecon_precision,
             "execution_mode": "streaming",
             "sam3_workers": args.sam3_workers if not keyframe_reused else 0,
@@ -581,12 +610,15 @@ def main() -> None:
         "prepare_rectified": args.prepare_rectified,
         "cameras": cameras,
         "keyframe_stride": args.keyframe_stride,
+        "sam3_prompt_preset": args.sam3_prompt_preset,
+        "sam3_duplicate_mask_containment": args.sam3_duplicate_mask_containment,
         "sam3_torch_threads": args.sam3_torch_threads,
         "mobrecon_torch_threads": args.mobrecon_torch_threads,
         "mobrecon_root": str(args.mobrecon_root),
         "mobrecon_checkpoint": str(args.mobrecon_checkpoint) if args.mobrecon_checkpoint else None,
         "one_euro_min_cutoff": args.one_euro_min_cutoff,
         "one_euro_beta": args.one_euro_beta,
+        "handedness_switch_confirm_keyframes": args.handedness_switch_confirm_keyframes,
         "mobrecon_precision": args.mobrecon_precision,
         "execution_mode": "sequential",
         "sam3_workers": args.sam3_workers if not keyframe_reused else 0,

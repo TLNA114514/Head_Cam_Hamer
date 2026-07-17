@@ -204,6 +204,8 @@ The MobRecon low-latency path prepares or reuses the
   --group-range 0-999 \
   --keyframe-stride 10 \
   --sam3-workers 2 \
+  --sam3-prompt-preset bare \
+  --sam3-duplicate-mask-containment 0.9 \
   --mobrecon-device cpu \
   --mobrecon-precision float32 \
   --mobrecon-torch-threads 8
@@ -215,6 +217,13 @@ rig, not a universal camera subset; validate camera combinations again for a
 different rig or a quality-first run. GPU FP32 MobRecon is worth testing with
 one resident SAM3 worker, but measured GPU contention reduced total throughput
 when two SAM3 workers ran concurrently.
+
+MobRecon now defaults to accuracy-first handedness. The `bare` prompt set adds
+semantic left/right evidence. Duplicate suppression removes only candidates
+whose masks satisfy `intersection / min(area) >= 0.9`, so spatially separate
+hands remain independent. An established track must receive two conflicting
+semantic keyframes before its side changes. Use `--sam3-prompt-preset realtime`
+explicitly for higher throughput when weaker handedness evidence is acceptable.
 
 `--image-root` defaults to the directory containing `frames.jsonl`, and
 `--calib` defaults to `cameras.yaml` in that directory. Therefore the compact
@@ -262,6 +271,8 @@ The corresponding MobRecon low-latency run is:
   --group-range 0-619 \
   --keyframe-stride 10 \
   --sam3-workers 2 \
+  --sam3-prompt-preset bare \
+  --sam3-duplicate-mask-containment 0.9 \
   --mobrecon-device cpu \
   --mobrecon-precision float32 \
   --mobrecon-torch-threads 8
@@ -279,8 +290,9 @@ For gloved hands:
   --group-range 0-999
 ```
 
-This `--prompt-preset` example belongs to the HaMeR path. The MobRecon realtime
-path uses the realtime prompt validated for its sparse keyframes.
+This `--prompt-preset` example belongs to the HaMeR path. MobRecon uses the
+separate `--sam3-prompt-preset gloved` option; its default is now the
+accuracy-first `bare` preset rather than a fixed `realtime` prompt.
 
 Inspect the generated commands without running inference:
 

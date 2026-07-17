@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -49,10 +50,19 @@ from run_sam3_bbox_on_video import (  # type: ignore  # noqa: E402
 
 PROMPT_PRESETS = {
     "bare": ["bare hand", "human hand", "hand", "left hand", "right hand"],
-    "gloved": ["black fingerless glove", "fingerless glove", "gloved hand", "hand wearing black glove"],
+    "gloved": [
+        "black fingerless glove",
+        "fingerless glove",
+        "gloved hand",
+        "hand wearing black glove",
+        "left gloved hand",
+        "right gloved hand",
+    ],
     "realtime": ["hand"],
     "custom": [],
 }
+
+TRUSTED_HANDEDNESS_SOURCES = {"manual", "prompt", "prompt_cluster"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,7 +73,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sam3-root", type=Path, default=DEFAULT_SAM3_ROOT)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--hf-endpoint", default="https://hf-mirror.com")
-    parser.add_argument("--no-hf", action="store_true")
+    parser.add_argument(
+        "--no-hf",
+        action="store_true",
+        help="Disable Hugging Face loading; requires --checkpoint to avoid an uninitialized SAM3 model.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--amp-dtype", choices=["float32", "bfloat16", "float16"], default="float32")
     parser.add_argument("--torch-threads", type=int, default=2)
@@ -78,6 +92,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-hands", type=int, default=2)
     parser.add_argument("--hand-selection", choices=["area", "score", "score-area"], default="score-area")
     parser.add_argument("--nms-iou", type=float, default=0.5)
+    parser.add_argument(
+        "--duplicate-mask-containment",
+        type=float,
+        default=0.9,
+        help="Suppress nested SAM3 masks when intersection/min(area) reaches this value; 0 disables it.",
+    )
     parser.add_argument("--bbox-pad", type=float, default=1.15)
     parser.add_argument("--merge-mode", choices=["largest", "all", "none"], default="none")
     parser.add_argument("--mask-component", choices=["largest", "all"], default="largest")
@@ -139,6 +159,58 @@ def save_masks(hands: list[dict], mask_dir: Path, group_id: int, camera_id: str)
     return out
 
 
+def mask_containment(first: dict, second: dict) -> float:
+    first_mask = first.get("_mask")
+    second_mask = second.get("_mask")
+    if first_mask is None or second_mask is None:
+        return 0.0
+    first_array = np.asarray(first_mask, dtype=bool)
+    second_array = np.asarray(second_mask, dtype=bool)
+    if first_array.shape != second_array.shape:
+        return 0.0
+    first_area = int(first_array.sum())
+    second_area = int(second_array.sum())
+    minimum_area = min(first_area, second_area)
+    if minimum_area <= 0:
+        return 0.0
+    intersection = int(np.logical_and(first_array, second_array).sum())
+    return float(intersection / minimum_area)
+
+
+def inherit_trusted_handedness(kept: dict, duplicate: dict) -> None:
+    kept_source = str(kept.get("handedness_source") or "")
+    duplicate_source = str(duplicate.get("handedness_source") or "")
+    if kept_source in TRUSTED_HANDEDNESS_SOURCES or duplicate_source not in TRUSTED_HANDEDNESS_SOURCES:
+        return
+    kept["is_right"] = duplicate.get("is_right")
+    kept["handedness_source"] = duplicate_source
+    kept["handedness_prompt"] = duplicate.get("handedness_prompt")
+
+
+def suppress_duplicate_hands(hands: list[dict], threshold: float) -> tuple[list[dict], int]:
+    if threshold <= 0.0:
+        return hands, 0
+    selected: list[dict] = []
+    suppressed = 0
+    for hand in hands:
+        duplicate = next(
+            (
+                kept
+                for kept in selected
+                if hand.get("handedness_source") != "hypothesis"
+                and kept.get("handedness_source") != "hypothesis"
+                and mask_containment(hand, kept) >= threshold
+            ),
+            None,
+        )
+        if duplicate is None:
+            selected.append(hand)
+            continue
+        inherit_trusted_handedness(duplicate, hand)
+        suppressed += 1
+    return selected, suppressed
+
+
 def main() -> None:
     args = parse_args()
     if args.torch_threads < 1:
@@ -148,10 +220,14 @@ def main() -> None:
     args.sam3_root = args.sam3_root.expanduser().resolve()
     if args.checkpoint:
         args.checkpoint = args.checkpoint.expanduser().resolve()
+    if args.no_hf and args.checkpoint is None:
+        raise SystemExit("--no-hf requires --checkpoint; otherwise SAM3 has no pretrained weights")
     if args.hf_endpoint:
         os.environ["HF_ENDPOINT"] = args.hf_endpoint
     if args.max_hands < 1:
         raise SystemExit("--max-hands must be >= 1")
+    if not 0.0 <= args.duplicate_mask_containment <= 1.0:
+        raise SystemExit("--duplicate-mask-containment must be in [0, 1]")
     if args.frame_stride < 1 or not 0 <= args.frame_offset < args.frame_stride:
         raise SystemExit("--frame-stride must be positive and --frame-offset must be in [0, stride)")
     if args.max_hands > 1 and args.merge_mode == "largest":
@@ -211,6 +287,7 @@ def main() -> None:
         "records": len(records),
         "frames_with_hands": 0,
         "hands": 0,
+        "suppressed_duplicate_hands": 0,
         "missing_images": 0,
     }
     inference_started = time.perf_counter()
@@ -249,7 +326,13 @@ def main() -> None:
                 for prompt in prompts:
                     output = processor.set_text_prompt(prompt=prompt, state=state)
                     detections.extend(collect_detections(output, prompt, image_bgr.shape, args))
-            hands = merge_detections(detections, image_bgr.shape, args)
+            merge_args = copy.copy(args)
+            if args.merge_mode == "none" and args.duplicate_mask_containment > 0.0:
+                merge_args.max_hands = max(args.max_hands, min(8, args.max_hands * 3))
+            hands = merge_detections(detections, image_bgr.shape, merge_args)
+            hands, suppressed = suppress_duplicate_hands(hands, args.duplicate_mask_containment)
+            hands = hands[: args.max_hands]
+            stats["suppressed_duplicate_hands"] += suppressed
             assign_track_ids(hands)
             json_hands = save_masks(hands, mask_dir, group_id, camera_id)
 
@@ -309,6 +392,7 @@ def main() -> None:
         "prompt_preset": args.prompt_preset,
         "prompts": prompts,
         "max_hands": args.max_hands,
+        "duplicate_mask_containment": args.duplicate_mask_containment,
         "amp_dtype": args.amp_dtype,
         "torch_threads": args.torch_threads,
         "timing": timing,

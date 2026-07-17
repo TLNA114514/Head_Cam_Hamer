@@ -141,14 +141,18 @@ conda run --no-capture-output -n hamer python scripts/fuse_hamer_palm_local.py \
 新增 `scripts/track_sam3_sparse_keyframes.py`、`scripts/mobrecon_realtime_cpu.py` 和
 `scripts/run_sparse_sam3_mobrecon.py`：
 
-- SAM3 使用单个 `hand` 提示，只处理每路相机每 10 帧中的 1 帧；
+- SAM3 只处理每路相机每 10 帧中的 1 帧；准确性默认使用含左右手语义的 `bare` prompt，
+  `realtime` 单 `hand` prompt 仅保留为显式速度档；
+- 对 `intersection / min(area) >= 0.9` 的嵌套掩码做去重，但不合并空间上分离的两只手；
 - 非 keyframe 在 `0.25x` 灰度图上使用 pyramidal LK 光流传播框；
 - 离线兼容路径的 jobs 阶段使用 `--no-use-mediapipe --mask-frame-mode none --no-save-debug`；
 - 吞吐默认只取 `C0,C2,C3`，减少 25% 图像负载；这是当前两段数据和 10 FPS gate 下的工程配置，不是跨样本最优相机集合的结论；
 - 最多启动两个 SAM3 worker，每个进程在所属相机序列内只加载一次模型；
 - MobRecon 默认放 CPU，避免和 SAM3 争抢 24GB 显存；
 - 实时 CPU worker 把图像读取、光流、crop、MobRecon 和逐帧 palm-local fusion 合并到一个常驻进程，每张图只读一次；
-- 未知单手框不依赖未来帧：同时运行 Left/Right 两个 MobRecon 假设，再按同帧多视角掌局部形状选择；
+- 未知手框不依赖未来帧：同时运行 Left/Right 两个 MobRecon 假设，再全局最小化同帧多视角掌局部
+  形状误差；同一相机的两个独立候选不能落到同一侧，因此一只手和两只手都使用同一套逻辑；
+- 已建立轨迹的左右手标签需要两个冲突语义 keyframe 才切换，避免单帧 prompt 误判扩散；
 - detector 使用 line-buffered JSONL；默认 `streaming` 调度让双 SAM3 producer 与 CPU consumer 同时运行；
 - SAM3/MobRecon 默认分别限制为 2/8 个 CPU thread，避免并行进程争抢 i9-12900K；
 - palm-local 输出使用在线 One-Euro 滤波，逐帧更新且不读取未来帧；raw/filtered 两份关节同时保留；
@@ -609,8 +613,10 @@ Hamba 官方结果在 FreiHAND 达到 PA-MPVPE `5.3mm`，并强调用更少 toke
 | O47 | Prediction I/O | 完整序列，joint-only | L 176.3→11.5MiB；R 190.5→13.3MiB | 不变 | 不变 | JSON 减少 93.5%/93.0% |
 | O48 | Overlay I/O | 完整序列，默认关闭 | 避免 L 930.2MiB；R 617.8MiB | 不变 | 不变 | debug 时显式开启 |
 | O49 | SAM3 debug I/O | 完整序列，bbox/mask debug 默认关闭 | 避免 L 1.36GiB；R 1.45GiB；推理 mask 保留 | 不变 | 不变 | 不删除 inference masks |
+| O50 | 单双手与左右手修复 | `video/7.17` 0--383，四相机，`bare`，包含阈值 0.9 | 6.080 cold E2E / 7.508 steady FPS；11 个嵌套候选被抑制 | — | 758 融合手→384/384 帧单 Right；无空帧 | 手数/身份回归通过；尚不是双手 GT 3D 精度实验 |
 
 当前部署选择可直接从表中读取：严格沿用已经通过冷启动 10 FPS gate 的配置时用 O10--O13；
 精度优先、模型常驻时保留 O28 的四路 per-view prediction，并在更大验证集上学习相机可靠度；
+左右手与手数准确性优先时采用 O50 的 `bare` 默认；
 不要采用 O33 的四 SAM3 进程，也不要因为 O35 的 standalone 速度就把双 SAM3 下的 MobRecon
 强行迁到同一 GPU，O30 已证明这会降低整链路吞吐。

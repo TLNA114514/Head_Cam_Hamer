@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import time
 from collections import defaultdict
@@ -73,6 +74,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--one-euro-beta", type=float, default=0.05)
     parser.add_argument("--one-euro-derivative-cutoff", type=float, default=1.0)
     parser.add_argument("--frame-rate", type=float, default=25.0)
+    parser.add_argument(
+        "--handedness-switch-confirm-keyframes",
+        type=int,
+        default=2,
+        help="Require this many conflicting semantic keyframes before changing an established track side.",
+    )
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="cpu")
     parser.add_argument("--precision", choices=["float32", "float16"], default="float32")
     parser.add_argument("--export-vertices", action=argparse.BooleanOptionalAction, default=False)
@@ -108,6 +115,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--follow-keyframes requires --keyframe-shard")
     if args.keyframe_timeout <= 0.0:
         raise SystemExit("--keyframe-timeout must be positive")
+    if args.handedness_switch_confirm_keyframes < 1:
+        raise SystemExit("--handedness-switch-confirm-keyframes must be positive")
 
 
 def group_frame_records(records: list[dict[str, Any]]) -> list[tuple[int, dict[str, dict[str, Any]]]]:
@@ -244,36 +253,69 @@ def hand_job(
         "track_id": hand.get("track_id"),
         "locked_handedness": hand.get("locked_handedness"),
         "handedness_confidence": hand.get("handedness_confidence"),
+        "track_is_keyframe": bool(hand.get("is_keyframe")),
         "debug_only": False,
     }
 
 
 def assign_online_handedness(
-    jobs: list[dict[str, Any]], track_handedness: dict[tuple[str, str], str]
+    jobs: list[dict[str, Any]],
+    track_handedness: dict[tuple[str, str], str],
+    track_conflicts: dict[tuple[str, str], tuple[str, int]] | None = None,
+    switch_confirm_keyframes: int = 2,
 ) -> tuple[list[dict[str, Any]], int]:
+    if track_conflicts is None:
+        track_conflicts = {}
+    for handedness in ("Left", "Right"):
+        same_side = [job for job in jobs if str(job.get("handedness") or "").title() == handedness]
+        if len(same_side) <= 1:
+            continue
+
+        def evidence_key(job: dict[str, Any]) -> tuple[int, float, int]:
+            track_id = job.get("track_id")
+            track_key = (str(job["camera_id"]), str(track_id)) if track_id is not None else None
+            inherited = track_handedness.get(track_key) if track_key is not None else None
+            confidence = job.get("handedness_score")
+            confidence_value = float(confidence) if isinstance(confidence, (int, float)) else -1.0
+            return int(inherited == handedness), confidence_value, -int(job.get("job_index", 0))
+
+        strongest = max(same_side, key=evidence_key)
+        for job in same_side:
+            if job is strongest:
+                continue
+            job["observed_handedness"] = handedness
+            job["observed_handedness_source"] = job.get("handedness_source")
+            job["handedness"] = "unknown"
+            job["handedness_source"] = "online_same_side_collision"
+            job["is_right"] = None
     unresolved = []
     for job in jobs:
         handedness = str(job.get("handedness") or "").title()
         track_id = job.get("track_id")
+        track_key = (str(job["camera_id"]), str(track_id)) if track_id is not None else None
         if handedness in {"Left", "Right"}:
-            if track_id is not None:
-                track_handedness[(str(job["camera_id"]), str(track_id))] = handedness
+            inherited = track_handedness.get(track_key) if track_key is not None else None
+            if inherited is not None and inherited != handedness:
+                observed_source = job.get("handedness_source")
+                confirmed = False
+                if bool(job.get("track_is_keyframe")):
+                    previous_side, previous_count = track_conflicts.get(track_key, ("", 0))
+                    conflict_count = previous_count + 1 if previous_side == handedness else 1
+                    track_conflicts[track_key] = (handedness, conflict_count)
+                    confirmed = conflict_count >= switch_confirm_keyframes
+                if not confirmed:
+                    job["observed_handedness"] = handedness
+                    job["observed_handedness_source"] = observed_source
+                    job["handedness"] = inherited
+                    job["handedness_source"] = "online_track_conflict_hold"
+                    job["is_right"] = int(inherited == "Right")
+                    continue
+            if track_key is not None:
+                track_handedness[track_key] = handedness
+                track_conflicts.pop(track_key, None)
         else:
             unresolved.append(job)
-    if len(unresolved) == 2:
-        ordered = sorted(
-            unresolved,
-            key=lambda job: 0.5 * (job["bbox_rectified_px"][0] + job["bbox_rectified_px"][2]),
-        )
-        for job, handedness in zip(ordered, ("Left", "Right")):
-            job["handedness"] = handedness
-            job["handedness_source"] = "online_spatial_pair"
-            job["is_right"] = int(handedness == "Right")
-            if job.get("track_id") is not None:
-                track_handedness[(str(job["camera_id"]), str(job["track_id"]))] = handedness
     for job in unresolved:
-        if str(job.get("handedness") or "").title() in {"Left", "Right"}:
-            continue
         track_id = job.get("track_id")
         inherited = track_handedness.get((str(job["camera_id"]), str(track_id))) if track_id is not None else None
         if inherited:
@@ -308,14 +350,83 @@ def fusion_args() -> SimpleNamespace:
     )
 
 
-def hypothesis_distance(candidate: dict[str, Any], references: list[np.ndarray], history: np.ndarray | None) -> float:
-    if references:
-        target = np.mean(np.stack(references, axis=0), axis=0)
-    elif history is not None:
-        target = history
-    else:
-        return float("inf")
-    return float(np.mean(np.linalg.norm(candidate["joints"] - target, axis=1)))
+def selected_camera_candidates(
+    candidates: dict[str, dict[str, list[dict[str, Any]]]], handedness: str
+) -> list[dict[str, Any]]:
+    return [
+        max(values, key=lambda item: item["quality_score"])
+        for values in candidates.get(handedness, {}).values()
+        if values
+    ]
+
+
+def handedness_assignment_cost(
+    candidates: dict[str, dict[str, list[dict[str, Any]]]], shape_history: dict[str, np.ndarray]
+) -> tuple[float, int]:
+    cost = 0.0
+    active_hands = 0
+    for handedness in ("Left", "Right"):
+        items = selected_camera_candidates(candidates, handedness)
+        if not items:
+            continue
+        active_hands += 1
+        stacked = np.stack([item["joints"] for item in items], axis=0)
+        mean_shape = np.mean(stacked, axis=0)
+        if len(items) >= 2:
+            cost += float(np.mean(np.linalg.norm(stacked - mean_shape[None, :, :], axis=2)))
+        history = shape_history.get(handedness)
+        if history is not None:
+            cost += 0.35 * float(np.mean(np.linalg.norm(mean_shape - history, axis=1)))
+    cost += 0.02 * max(0, active_hands - 1)
+    return cost, active_hands
+
+
+def select_ambiguous_hypotheses(
+    candidates: dict[str, dict[str, list[dict[str, Any]]]],
+    ambiguous: dict[str, list[tuple[str, dict[str, Any]]]],
+    shape_history: dict[str, np.ndarray],
+) -> list[tuple[str, dict[str, Any]]]:
+    if not ambiguous:
+        return []
+    hypothesis_ids = sorted(ambiguous)
+    option_sets = [
+        sorted(ambiguous[hypothesis_id], key=lambda item: (item[0] != "Right", item[0]))
+        for hypothesis_id in hypothesis_ids
+    ]
+    base = {
+        handedness: {camera_id: list(values) for camera_id, values in candidates.get(handedness, {}).items()}
+        for handedness in ("Left", "Right")
+    }
+    best_selection: list[tuple[str, dict[str, Any]]] | None = None
+    best_key: tuple[float, int] | None = None
+    for selection in itertools.product(*option_sets):
+        trial = {
+            handedness: {camera_id: list(values) for camera_id, values in base[handedness].items()}
+            for handedness in ("Left", "Right")
+        }
+        occupied = {
+            (handedness, camera_id)
+            for handedness in ("Left", "Right")
+            for camera_id, values in trial[handedness].items()
+            if values
+        }
+        valid = True
+        for handedness, candidate in selection:
+            key = (handedness, candidate["camera_id"])
+            if key in occupied:
+                valid = False
+                break
+            occupied.add(key)
+            trial[handedness].setdefault(candidate["camera_id"], []).append(candidate)
+        if not valid:
+            continue
+        key = handedness_assignment_cost(trial, shape_history)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_selection = list(selection)
+    if best_selection is not None:
+        return best_selection
+    return [options[0] for options in option_sets if options]
 
 
 def fuse_group(
@@ -337,28 +448,16 @@ def fuse_group(
             ambiguous[str(hypothesis_id)].append((handedness, candidate))
         else:
             candidates[handedness][str(prediction["camera_id"])].append(candidate)
-    selected_hypotheses = 0
-    for options in ambiguous.values():
-        scored = []
-        for handedness, candidate in options:
-            references = [
-                item["joints"]
-                for camera_items in candidates[handedness].values()
-                for item in camera_items
-            ]
-            distance = hypothesis_distance(candidate, references, shape_history.get(handedness))
-            scored.append((distance, handedness, candidate))
-        finite = [item for item in scored if np.isfinite(item[0])]
-        chosen = min(finite or scored, key=lambda item: (item[0], item[1]))
-        _distance, handedness, candidate = chosen
+    selected = select_ambiguous_hypotheses(candidates, ambiguous, shape_history)
+    for handedness, candidate in selected:
         candidates[handedness][candidate["camera_id"]].append(candidate)
         track_id = candidate["record"].get("track_id")
         if track_id is not None:
             track_handedness[(candidate["camera_id"], str(track_id))] = handedness
-        selected_hypotheses += 1
+    selected_hypotheses = len(selected)
     hands = []
     for handedness in ("Left", "Right"):
-        items = [max(values, key=lambda item: item["quality_score"]) for values in candidates[handedness].values() if values]
+        items = selected_camera_candidates(candidates, handedness)
         if not items:
             continue
         items.sort(key=lambda item: item["camera_id"])
@@ -506,6 +605,7 @@ def main() -> None:
 
     states = {camera_id: tracker_state() for camera_id in cameras}
     track_handedness: dict[tuple[str, str], str] = {}
+    track_handedness_conflicts: dict[tuple[str, str], tuple[str, int]] = {}
     fused_shape_history: dict[str, np.ndarray] = {}
     one_euro_filtered_state: dict[str, np.ndarray] = {}
     one_euro_raw_state: dict[str, np.ndarray] = {}
@@ -641,8 +741,16 @@ def main() -> None:
 
                 jobs_started = time.perf_counter()
                 jobs = [hand_job(hand, image_path, group_id, camera_id, index, args.bbox_pad) for index, hand in enumerate(hands)]
-                jobs, unresolved_count = assign_online_handedness(jobs, track_handedness)
+                jobs, unresolved_count = assign_online_handedness(
+                    jobs,
+                    track_handedness,
+                    track_handedness_conflicts,
+                    args.handedness_switch_confirm_keyframes,
+                )
                 stats["unresolved_handedness"] += unresolved_count
+                stats["handedness_conflicts_held"] += sum(
+                    job.get("handedness_source") == "online_track_conflict_hold" for job in jobs
+                )
                 job_record = {"type": "hamer_multiview_jobs", "group_id": group_id, "camera_id": camera_id, "jobs": jobs}
                 if jobs_output is not None:
                     jobs_output.write(json.dumps(job_record, ensure_ascii=False, separators=(",", ":")) + "\n")
@@ -697,6 +805,7 @@ def main() -> None:
         "one_euro_beta": args.one_euro_beta,
         "one_euro_derivative_cutoff": args.one_euro_derivative_cutoff,
         "frame_rate": args.frame_rate,
+        "handedness_switch_confirm_keyframes": args.handedness_switch_confirm_keyframes,
         "model_mib": model_mib,
         "peak_cuda_allocated_mib": peak_allocated_mib,
         "peak_cuda_reserved_mib": peak_reserved_mib,
