@@ -352,7 +352,7 @@ into the HaMeR pipeline. Runnable does not mean recommended as a default:
 | --- | --- | --- |
 | HaMeR execution optimization | `--hamer-speed-profile quality|balanced|fast|aggressive` | Directly usable; `quality` is the default |
 | MobRecon realtime path | `--pipeline mobrecon` | Directly usable; CPU FP32 and stride 10 are the defaults |
-| Zero-shot raw, bounded gap fill, causal, and offline smoothing | `--zero-shot-primary-output ...` | Raw observations stay untouched; missing runs of at most 2 frames are interpolated as non-metric fallbacks |
+| Zero-shot raw, bounded gap fill, causal, and offline smoothing | `--zero-shot-primary-output ...` | Raw observations stay untouched; gaps of at most 2 frames are filled and a five-frame Gaussian result is the default primary output |
 | Physical-PnP plus 0.04m view gate | `--run-mano-multiview-image-refine` | Optional image-side MANO refinement; HaMeR only |
 | Static glove similarity plus joint offsets | `calibrate_hamer_to_glove_local.py` | Conservative default when a synchronized glove calibration clip exists |
 | Ridge/local-KNN plus OOD residual | `calibrate_pose_residual_local.py` | Directly usable; KNN requires dense target-pose coverage |
@@ -364,8 +364,11 @@ into the HaMeR pipeline. Runnable does not mean recommended as a default:
 
 ### Switch the zero-shot primary output
 
-HaMeR uses the raw equal-weight multi-view result as its primary output by
-default. A causal deployment can select One-Euro instead:
+After multi-view fusion, HaMeR uses a five-frame Gaussian result with
+`radius=2` and `sigma=1.0` as `palm_local_joints_m` by default. The original
+equal-weight result remains available in `raw_palm_local_joints_m`. This
+offline default reads two frames before and after the current frame. A causal
+deployment can select One-Euro instead:
 
 ```bash
 ./scripts/run.sh \
@@ -377,13 +380,19 @@ default. A causal deployment can select One-Euro instead:
   --zero-shot-one-euro-beta 5.0
 ```
 
-For offline processing that may inspect future frames, select the Gaussian
-output:
+The default offline settings are equivalent to:
 
 ```text
 --zero-shot-primary-output smoothed
---zero-shot-temporal-radius 10
---zero-shot-temporal-sigma 4
+--zero-shot-temporal-radius 2
+--zero-shot-temporal-sigma 1.0
+```
+
+To restore a completely unsmoothed primary output:
+
+```text
+--zero-shot-primary-output raw
+--zero-shot-temporal-radius 0
 ```
 
 Fixed EMA uses `causal-smoothed` and a positive

@@ -324,7 +324,7 @@ pose/velocity residual、校准后 smoothing）已有 5/5 个可执行脚本；z
 | --- | --- | --- |
 | HaMeR 执行优化 | `--hamer-speed-profile quality|balanced|fast|aggressive` | 可直接用；默认 `quality` |
 | MobRecon 实时路线 | `--pipeline mobrecon` | 可直接用；默认 CPU FP32、stride 10 |
-| zero-shot raw / 短缺口补帧 / 因果 / 离线平滑 | `--zero-shot-primary-output ...` | 真实 raw 不改写；默认把不超过 2 帧的缺口补成非 metric fallback |
+| zero-shot raw / 短缺口补帧 / 因果 / 离线平滑 | `--zero-shot-primary-output ...` | 真实 raw 不改写；默认补齐不超过 2 帧的缺口，并用 5 帧 Gaussian 结果作为主输出 |
 | physical-PnP + 0.04m view gate | `--run-mano-multiview-image-refine` | 可选图像侧 MANO refine；仅 HaMeR |
 | 静态 glove similarity + joint offsets | `calibrate_hamer_to_glove_local.py` | 有同步 glove 校准片段时的保守默认 |
 | ridge / local-KNN + OOD residual | `calibrate_pose_residual_local.py` | 可直接用；KNN 只用于 pose 密集覆盖 |
@@ -336,7 +336,9 @@ pose/velocity residual、校准后 smoothing）已有 5/5 个可执行脚本；z
 
 ### 切换 zero-shot 主输出
 
-HaMeR 默认把 raw 等权多视角结果作为主输出。因果部署可切换到 One-Euro：
+HaMeR 默认在多视角融合后使用 `radius=2`、`sigma=1.0` 的 5 帧 Gaussian 平滑结果作为
+`palm_local_joints_m`，原始等权多视角结果仍完整保存在 `raw_palm_local_joints_m`。这一默认值
+适用于离线视频处理，会读取当前帧前后各 2 帧。实时或因果部署可切换到 One-Euro：
 
 ```bash
 ./scripts/run.sh \
@@ -348,12 +350,19 @@ HaMeR 默认把 raw 等权多视角结果作为主输出。因果部署可切换
   --zero-shot-one-euro-beta 5.0
 ```
 
-离线、允许读取未来帧时可使用 Gaussian 输出：
+默认离线参数等价于：
 
 ```text
 --zero-shot-primary-output smoothed
---zero-shot-temporal-radius 10
---zero-shot-temporal-sigma 4
+--zero-shot-temporal-radius 2
+--zero-shot-temporal-sigma 1.0
+```
+
+如果需要完全恢复未经时序平滑的主输出：
+
+```text
+--zero-shot-primary-output raw
+--zero-shot-temporal-radius 0
 ```
 
 固定 EMA 使用 `causal-smoothed` 和正的 `--zero-shot-causal-ema-alpha`。这里的

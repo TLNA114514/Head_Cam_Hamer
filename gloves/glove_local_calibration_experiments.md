@@ -653,11 +653,13 @@ path with that constraint:
 
 The generated config writes `uses_ground_truth: false`,
 `cross_view_weighting: equal`, and the exact output-field choice. The main
-pipeline runs this stage by default, but keeps `--zero-shot-primary-output raw`,
-zero bone calibration, and zero temporal smoothing as the deployment-safe
-defaults. The current deployment pipeline additionally enables bounded
-two-frame gap interpolation; set it to zero to reproduce the historical
-experiments in this section.
+pipeline runs this stage by default. The experiments in this section used raw
+as the primary output with zero bone calibration and zero temporal smoothing.
+After the later `bad_failure` jitter validation, the offline video pipeline
+changed its primary default to five-frame Gaussian smoothing while retaining
+raw observations separately. It also enables bounded two-frame gap
+interpolation; disable both features to reproduce the historical experiments
+in this section.
 
 ### Why Equal View Weights
 
@@ -690,18 +692,20 @@ and right 0--477 sequences.
 | Direct mean + adaptive causal One Euro | **27.07 / 24.83 / 51.59 / 101.16 mm** | **34.02 / 28.85 / 73.32 / 117.62 mm** |
 | Direct mean + offline Gaussian `radius=10,sigma=4` | **27.37 / 25.08 / 51.47 / 93.92 mm** | **34.31 / 29.40 / 73.06 / 120.25 mm** |
 
-The Gaussian result is an offline option with a ten-frame look-ahead, not a
-causal deployment claim. All temporal filters reset at missing detections, so
-they do not drag an old hand state across a gap. The raw field remains the
-authoritative observation in every mode.
+The Gaussian result evaluated here is an offline option with a ten-frame
+look-ahead, not a causal deployment claim; the current video-pipeline default
+uses only two frames on either side. All temporal filters reset at missing
+detections, so they do not drag an old hand state across a gap. The raw field
+remains the authoritative observation in every mode.
 
 The adaptive causal result uses the timestamp-derived frame rate (about 25 FPS) with
 `min_cutoff=0.2`, `beta=5.0`, and derivative cutoff `1.0`. Parameters were selected
 on even groups and then checked on held-out odd groups. On odd groups it reached
 `27.05/51.46mm` on left and `33.98/73.29mm` on right (mean/P95), versus fixed
 EMA's `27.44/51.69mm` and `34.51/74.11mm`. It uses no look-ahead and no glove
-input at inference; the pipeline computes this optional field by default while
-keeping raw as the primary output.
+input at inference. The pipeline computes this optional field by default;
+realtime processing may select it as primary, while offline video processing
+uses Gaussian smoothing by default.
 
 ### Static Calibration Without Pose Supervision
 

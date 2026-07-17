@@ -35,6 +35,10 @@ TTY_STREAM = None
 PROC_LOCK = Lock()
 ACTIVE_PROCS: set[subprocess.Popen] = set()
 
+DEFAULT_ZERO_SHOT_PRIMARY_OUTPUT = "smoothed"
+DEFAULT_ZERO_SHOT_TEMPORAL_RADIUS = 2
+DEFAULT_ZERO_SHOT_TEMPORAL_SIGMA = 1.0
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -175,11 +179,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--zero-shot-primary-output",
         choices=["raw", "static-calibrated", "smoothed", "causal-smoothed", "adaptive-causal"],
-        default="raw",
+        default=DEFAULT_ZERO_SHOT_PRIMARY_OUTPUT,
+        help=(
+            "Field copied to palm_local_joints_m; raw observations are always retained separately "
+            f"(default: {DEFAULT_ZERO_SHOT_PRIMARY_OUTPUT})."
+        ),
     )
     parser.add_argument("--zero-shot-bone-calibration-blend", type=float, default=0.0)
-    parser.add_argument("--zero-shot-temporal-radius", type=int, default=0)
-    parser.add_argument("--zero-shot-temporal-sigma", type=float, default=4.0)
+    parser.add_argument(
+        "--zero-shot-temporal-radius",
+        type=int,
+        default=DEFAULT_ZERO_SHOT_TEMPORAL_RADIUS,
+        help="Offline Gaussian radius in frames; the default radius 2 uses a five-frame window.",
+    )
+    parser.add_argument(
+        "--zero-shot-temporal-sigma",
+        type=float,
+        default=DEFAULT_ZERO_SHOT_TEMPORAL_SIGMA,
+        help=f"Offline Gaussian sigma in frames (default: {DEFAULT_ZERO_SHOT_TEMPORAL_SIGMA:g}).",
+    )
     parser.add_argument("--zero-shot-temporal-interpolation-max-gap", type=int, default=2)
     parser.add_argument("--zero-shot-temporal-interpolation-max-joint-displacement-m", type=float, default=0.12)
     parser.add_argument("--zero-shot-temporal-interpolation-max-bone-relative-change", type=float, default=0.20)
