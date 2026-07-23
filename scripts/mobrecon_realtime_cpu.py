@@ -18,7 +18,14 @@ import numpy as np
 import torch
 
 from fuse_hamer_jobs import best_handedness_from_sam3
-from fuse_hamer_palm_local import candidate_from_record, fuse_views, lowpass_alpha
+from fuse_hamer_palm_local import (
+    bone_lengths,
+    bone_vectors_to_joints,
+    candidate_from_record,
+    fuse_views,
+    joints_to_bone_vectors,
+    lowpass_alpha,
+)
 from hamer_multiview_utils import (
     DEFAULT_BASE_DIR,
     DEFAULT_FRAMES,
@@ -39,6 +46,9 @@ from mobrecon_multiview_worker import (
 )
 from progress_utils import tqdm
 from track_sam3_sparse_keyframes import load_hands, match_refresh, propagate_state, scaled_gray, state_to_hand
+
+
+HANDEDNESS_HISTORY_JOINTS = np.asarray([0, 5, 9, 13, 17], dtype=np.int64)
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,15 +75,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-forward-backward-error", type=float, default=0.0)
     parser.add_argument("--max-hands", type=int, default=2)
     parser.add_argument("--bbox-pad", type=float, default=1.15)
-    parser.add_argument("--crop-scale", type=float, default=1.5)
+    parser.add_argument(
+        "--crop-scale",
+        type=float,
+        default=1.15,
+        help="Additional crop scale after --bbox-pad; defaults combine to about 1.32, close to MobRecon training.",
+    )
     parser.add_argument("--input-size", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--microbatch-groups", type=int, default=1)
     parser.add_argument("--torch-threads", type=int, default=8)
     parser.add_argument("--one-euro-min-cutoff", type=float, default=0.25)
-    parser.add_argument("--one-euro-beta", type=float, default=0.05)
+    parser.add_argument(
+        "--one-euro-beta",
+        type=float,
+        default=100.0,
+        help="One-Euro speed coefficient in Hz per (m/s); 100 prioritizes immediate response during deliberate motion.",
+    )
     parser.add_argument("--one-euro-derivative-cutoff", type=float, default=1.0)
+    parser.add_argument(
+        "--one-euro-min-alpha",
+        type=float,
+        default=0.4,
+        help="Minimum new-frame weight; 0.4 keeps the causal response near one to two frames while reducing jitter.",
+    )
+    parser.add_argument(
+        "--one-euro-bone-space",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Filter bone vectors and reconstruct stable bone lengths to reduce jitter without shrinking finger motion.",
+    )
     parser.add_argument("--frame-rate", type=float, default=25.0)
+    parser.add_argument(
+        "--view-fusion",
+        choices=["mean", "quality-weighted", "robust-medoid"],
+        default="robust-medoid",
+        help="Cross-view pose fusion; robust-medoid avoids flattening finger motion through joint-wise averaging.",
+    )
+    parser.add_argument(
+        "--primary-output",
+        choices=["raw", "adaptive-causal"],
+        default="adaptive-causal",
+        help="Main palm_local_joints_m field. Motion-preserving adaptive filtering is the default; raw is retained separately.",
+    )
     parser.add_argument(
         "--handedness-switch-confirm-keyframes",
         type=int,
@@ -117,6 +161,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--keyframe-timeout must be positive")
     if args.handedness_switch_confirm_keyframes < 1:
         raise SystemExit("--handedness-switch-confirm-keyframes must be positive")
+    if not 0.0 <= args.one_euro_min_alpha <= 1.0:
+        raise SystemExit("--one-euro-min-alpha must be in [0, 1]")
+    if args.primary_output == "adaptive-causal" and args.one_euro_min_cutoff <= 0.0:
+        raise SystemExit("--primary-output adaptive-causal requires --one-euro-min-cutoff > 0")
 
 
 def group_frame_records(records: list[dict[str, Any]]) -> list[tuple[int, dict[str, dict[str, Any]]]]:
@@ -347,6 +395,7 @@ def fusion_args() -> SimpleNamespace:
         quality_source_bonus=0.06,
         quality_known_bonus=0.05,
         include_vertices=False,
+        view_fusion="robust-medoid",
     )
 
 
@@ -376,7 +425,8 @@ def handedness_assignment_cost(
             cost += float(np.mean(np.linalg.norm(stacked - mean_shape[None, :, :], axis=2)))
         history = shape_history.get(handedness)
         if history is not None:
-            cost += 0.35 * float(np.mean(np.linalg.norm(mean_shape - history, axis=1)))
+            palm_delta = mean_shape[HANDEDNESS_HISTORY_JOINTS] - history[HANDEDNESS_HISTORY_JOINTS]
+            cost += 0.35 * float(np.mean(np.linalg.norm(palm_delta, axis=1)))
     cost += 0.02 * max(0, active_hands - 1)
     return cost, active_hands
 
@@ -461,17 +511,20 @@ def fuse_group(
         if not items:
             continue
         items.sort(key=lambda item: item["camera_id"])
-        fused = fuse_views(items, None, 0.0, False)
+        fused = fuse_views(items, None, 0.0, False, args.view_fusion)
         shape_history[handedness] = fused["raw_joints"].copy()
         hands.append(
             {
                 "group_id": group_id,
                 "handedness": handedness,
-                "mode": "zero_shot_multiview_mean:raw",
+                "mode": f"zero_shot_multiview_{fused['fusion_method']}:raw",
                 "metric_valid": len(items) >= 2,
                 "local_shape_valid": True,
                 "fusion_view_count": len(items),
                 "used_cameras": [item["camera_id"] for item in items],
+                "used_track_ids_by_camera": {
+                    item["camera_id"]: item["record"].get("track_id") for item in items
+                },
                 "source_models": sorted({item["model_name"] for item in items}),
                 "palm_local_joints_m": fused["raw_joints"].tolist(),
                 "raw_palm_local_joints_m": fused["raw_joints"].tolist(),
@@ -486,6 +539,10 @@ def fuse_group(
                 "per_camera_consensus_error_m": fused["camera_errors_m"],
                 "per_camera_quality_scores": {item["camera_id"]: item["quality_score"] for item in items},
                 "per_camera_quality_parts": {item["camera_id"]: item["quality_parts"] for item in items},
+                "view_fusion_method": fused["fusion_method"],
+                "view_fusion_source_camera": fused["fusion_source_camera"],
+                "view_fusion_source_track_id": fused["fusion_source_track_id"],
+                "view_fusion_weights": fused["fusion_weights"],
                 "bone_calibration_blend": 0.0,
                 "temporal_radius": 0,
                 "temporal_sigma": None,
@@ -503,9 +560,13 @@ def fuse_group(
 def apply_one_euro(
     fused_record: dict[str, Any],
     filtered_state: dict[str, np.ndarray],
+    output_state: dict[str, np.ndarray],
     raw_state: dict[str, np.ndarray],
+    raw_output_state: dict[str, np.ndarray],
     derivative_state: dict[str, np.ndarray],
+    length_state: dict[str, np.ndarray],
     previous_group: dict[str, int],
+    identity_state: dict[str, set[str]],
     args: argparse.Namespace,
 ) -> None:
     if args.one_euro_min_cutoff <= 0.0:
@@ -514,12 +575,27 @@ def apply_one_euro(
     derivative_alpha = float(lowpass_alpha(args.one_euro_derivative_cutoff, args.frame_rate))
     for hand in fused_record["hands"]:
         handedness = str(hand["handedness"])
-        current = np.asarray(hand["raw_palm_local_joints_m"], dtype=np.float64)
-        contiguous = previous_group.get(handedness) == group_id - 1
+        alpha = None
+        current_joints = np.asarray(hand["raw_palm_local_joints_m"], dtype=np.float64)
+        current = joints_to_bone_vectors(current_joints) if args.one_euro_bone_space else current_joints
+        current_lengths = bone_lengths(current_joints) if args.one_euro_bone_space else None
+        current_identity = {
+            f"{camera_id}:{track_id}"
+            for camera_id, track_id in (hand.get("used_track_ids_by_camera") or {}).items()
+            if track_id is not None
+        }
+        previous_identity = identity_state.get(handedness, set())
+        identity_contiguous = not current_identity or not previous_identity or bool(current_identity & previous_identity)
+        prior_group = previous_group.get(handedness)
+        contiguous = prior_group == group_id - 1 and identity_contiguous
         if handedness not in filtered_state or not contiguous:
-            filtered = current.copy()
+            filtered_signal = current.copy()
             derivative = np.zeros_like(current)
+            if current_lengths is not None:
+                length_state[handedness] = current_lengths.copy()
         else:
+            previous_raw = raw_output_state[handedness]
+            previous_filtered = output_state[handedness]
             raw_derivative = (current - raw_state[handedness]) * args.frame_rate
             derivative = (
                 derivative_alpha * raw_derivative
@@ -527,21 +603,62 @@ def apply_one_euro(
             )
             joint_speed = np.linalg.norm(derivative, axis=1, keepdims=True)
             cutoff = args.one_euro_min_cutoff + args.one_euro_beta * joint_speed
-            alpha = lowpass_alpha(cutoff, args.frame_rate)
-            filtered = alpha * current + (1.0 - alpha) * filtered_state[handedness]
-        filtered_state[handedness] = filtered
+            alpha = np.maximum(lowpass_alpha(cutoff, args.frame_rate), args.one_euro_min_alpha)
+            filtered_signal = alpha * current + (1.0 - alpha) * filtered_state[handedness]
+            if current_lengths is not None:
+                length_alpha = max(
+                    float(lowpass_alpha(args.one_euro_min_cutoff, args.frame_rate)),
+                    0.5 * args.one_euro_min_alpha,
+                )
+                length_state[handedness] = (
+                    length_alpha * current_lengths
+                    + (1.0 - length_alpha) * length_state[handedness]
+                )
+        filtered = (
+            bone_vectors_to_joints(filtered_signal, length_state[handedness], current)
+            if args.one_euro_bone_space
+            else filtered_signal
+        )
+        filtered_state[handedness] = filtered_signal
+        output_state[handedness] = filtered
         raw_state[handedness] = current
+        raw_output_state[handedness] = current_joints
         derivative_state[handedness] = derivative
         previous_group[handedness] = group_id
+        identity_state[handedness] = current_identity
         filtered_list = filtered.tolist()
-        hand["mode"] = "zero_shot_multiview_mean:adaptive-causal"
-        hand["palm_local_joints_m"] = filtered_list
         hand["adaptive_causal_palm_local_joints_m"] = filtered_list
         hand["one_euro_min_cutoff"] = args.one_euro_min_cutoff
         hand["one_euro_beta"] = args.one_euro_beta
         hand["one_euro_derivative_cutoff"] = args.one_euro_derivative_cutoff
+        hand["one_euro_min_alpha"] = args.one_euro_min_alpha
+        hand["one_euro_bone_space"] = args.one_euro_bone_space
         hand["frame_rate"] = args.frame_rate
-        hand["primary_output_source"] = "adaptive-causal"
+        hand["one_euro_beta_units"] = "hz_per_m_per_s"
+        hand["filter_state_reset_reason"] = None if contiguous else (
+            "track_identity_changed" if prior_group == group_id - 1 and not identity_contiguous else "sequence_gap"
+        )
+        if alpha is not None:
+            raw_motion = np.linalg.norm(current_joints - previous_raw, axis=1)
+            filtered_motion = np.linalg.norm(filtered - previous_filtered, axis=1)
+            lag = np.linalg.norm(current_joints - filtered, axis=1)
+            hand["one_euro_alpha_mean"] = float(np.mean(alpha))
+            hand["one_euro_alpha_min"] = float(np.min(alpha))
+            hand["one_euro_alpha_max"] = float(np.max(alpha))
+            hand["raw_motion_mean_m"] = float(np.mean(raw_motion))
+            hand["filtered_motion_mean_m"] = float(np.mean(filtered_motion))
+            hand["filter_lag_mean_m"] = float(np.mean(lag))
+        else:
+            hand["one_euro_alpha_mean"] = None
+            hand["one_euro_alpha_min"] = None
+            hand["one_euro_alpha_max"] = None
+            hand["raw_motion_mean_m"] = None
+            hand["filtered_motion_mean_m"] = None
+            hand["filter_lag_mean_m"] = 0.0
+        if args.primary_output == "adaptive-causal":
+            hand["mode"] = f"zero_shot_multiview_{hand['view_fusion_method']}:adaptive-causal"
+            hand["palm_local_joints_m"] = filtered_list
+            hand["primary_output_source"] = "adaptive-causal"
 
 
 def percentile(values: list[float], quantile: float) -> float | None:
@@ -608,14 +725,19 @@ def main() -> None:
     track_handedness_conflicts: dict[tuple[str, str], tuple[str, int]] = {}
     fused_shape_history: dict[str, np.ndarray] = {}
     one_euro_filtered_state: dict[str, np.ndarray] = {}
+    one_euro_output_state: dict[str, np.ndarray] = {}
     one_euro_raw_state: dict[str, np.ndarray] = {}
+    one_euro_raw_output_state: dict[str, np.ndarray] = {}
     one_euro_derivative_state: dict[str, np.ndarray] = {}
+    one_euro_length_state: dict[str, np.ndarray] = {}
     one_euro_previous_group: dict[str, int] = {}
+    one_euro_identity_state: dict[str, set[str]] = {}
     stats: dict[str, int] = defaultdict(int)
     timing: dict[str, float] = defaultdict(float)
     group_latencies = []
     pending_packets: list[dict[str, Any]] = []
     fusion_config = fusion_args()
+    fusion_config.view_fusion = args.view_fusion
     processing_started = time.perf_counter()
 
     tracks_file = output_paths["tracks"].open("w", encoding="utf-8", buffering=1) if args.write_intermediates else nullcontext()
@@ -682,9 +804,13 @@ def main() -> None:
                 apply_one_euro(
                     fused_record,
                     one_euro_filtered_state,
+                    one_euro_output_state,
                     one_euro_raw_state,
+                    one_euro_raw_output_state,
                     one_euro_derivative_state,
+                    one_euro_length_state,
                     one_euro_previous_group,
+                    one_euro_identity_state,
                     args,
                 )
                 fused_output.write(json.dumps(fused_record, ensure_ascii=False, separators=(",", ":")) + "\n")
@@ -794,6 +920,9 @@ def main() -> None:
         "group_ids": args.group_ids,
         "keyframe_stride": args.keyframe_stride,
         "flow_scale": args.flow_scale,
+        "bbox_pad": args.bbox_pad,
+        "crop_scale": args.crop_scale,
+        "effective_crop_scale": args.bbox_pad * args.crop_scale,
         "max_flow_error": args.max_flow_error,
         "max_forward_backward_error": args.max_forward_backward_error,
         "microbatch_groups": args.microbatch_groups,
@@ -804,7 +933,11 @@ def main() -> None:
         "one_euro_min_cutoff": args.one_euro_min_cutoff,
         "one_euro_beta": args.one_euro_beta,
         "one_euro_derivative_cutoff": args.one_euro_derivative_cutoff,
+        "one_euro_min_alpha": args.one_euro_min_alpha,
+        "one_euro_bone_space": args.one_euro_bone_space,
         "frame_rate": args.frame_rate,
+        "view_fusion": args.view_fusion,
+        "primary_output": args.primary_output,
         "handedness_switch_confirm_keyframes": args.handedness_switch_confirm_keyframes,
         "model_mib": model_mib,
         "peak_cuda_allocated_mib": peak_allocated_mib,

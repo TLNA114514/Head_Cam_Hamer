@@ -225,6 +225,16 @@ hands remain independent. An established track must receive two conflicting
 semantic keyframes before its side changes. Use `--sam3-prompt-preset realtime`
 explicitly for higher throughput when weaker handedness evidence is acceptable.
 
+Pose output is accuracy-first as well. Combined bbox/crop padding is about
+`1.32`, close to MobRecon training crops, and `robust-medoid` keeps one coherent
+cross-view pose instead of averaging joints into an intermediate gesture.
+`palm_local_joints_m` now points to a motion-preserving filtered result by
+default. One-Euro operates on parent-to-child bone vectors, uses a minimum
+new-frame weight of `0.4` for a causal one-to-two-frame response without future
+frame buffering, and stabilizes bone lengths separately. Raw joints remain in `raw_palm_local_joints_m`; add
+`--mobrecon-primary-output raw` to disable smoothing as the primary output. The
+meter-scale default `beta` is `100.0`.
+
 `--image-root` defaults to the directory containing `frames.jsonl`, and
 `--calib` defaults to `cameras.yaml` in that directory. Therefore the compact
 form is usually enough:

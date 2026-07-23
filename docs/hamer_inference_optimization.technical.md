@@ -155,7 +155,7 @@ conda run --no-capture-output -n hamer python scripts/fuse_hamer_palm_local.py \
 - 已建立轨迹的左右手标签需要两个冲突语义 keyframe 才切换，避免单帧 prompt 误判扩散；
 - detector 使用 line-buffered JSONL；默认 `streaming` 调度让双 SAM3 producer 与 CPU consumer 同时运行；
 - SAM3/MobRecon 默认分别限制为 2/8 个 CPU thread，避免并行进程争抢 i9-12900K；
-- palm-local 输出使用在线 One-Euro 滤波，逐帧更新且不读取未来帧；raw/filtered 两份关节同时保留；
+- palm-local 同时保留 raw/filtered 两份关节；当前默认以骨空间 filtered 为主输出，在线 One-Euro 逐帧更新且不读取未来帧；
 - 最终 config 区分真实 `end_to_end_fps` 与复用 keyframe 时的 `reused_keyframe_pipeline_fps`。
 
 ### 跟踪框实测
@@ -281,9 +281,14 @@ conda run --no-capture-output -n hamer python scripts/run_sparse_sam3_mobrecon.p
   --mobrecon-device cpu \
   --mobrecon-torch-threads 8 \
   --one-euro-min-cutoff 0.25 \
-  --one-euro-beta 0.05 \
+  --one-euro-beta 100.0 \
+  --one-euro-min-alpha 0.4 \
+  --mobrecon-primary-output adaptive-causal \
   --overwrite
 ```
+
+这里的 `beta=100.0`、`min_alpha=0.4` 是修正米制速度量纲后的当前低延迟推荐值。O10 等历史表格使用的旧参数主要优化逐帧
+误差，存在明显动态滞后，历史数值保留作对照，不应视为握拳动作保真度的验收结果。
 
 checkpoint 路径可替换为本机实际 snapshot；若允许 Hugging Face 下载，可去掉 checkpoint 和
 `--sam3-no-hf`。输出的

@@ -203,6 +203,13 @@ MobRecon 当前以准确性为默认取向：`bare` prompt 会额外提供左右
 已经建立的轨迹需要连续两个冲突 keyframe 才会切换左右手标签。若更看重速度，可显式改为
 `--sam3-prompt-preset realtime`，但该单 prompt 模式缺少直接的左右手语义证据。
 
+姿态输出同样采用准确性优先默认值：bbox 与 crop 的合并倍率约为 `1.32`，接近 MobRecon 的训练裁剪；
+跨视角使用 `robust-medoid` 保留一套完整手型，不再逐关节强制平均。最终 `palm_local_joints_m` 默认指向
+动作保真的 filtered：在父子骨向量空间做因果 One-Euro，单帧权重不低于 `0.4`，等效响应约 1--2 帧，
+不缓存未来帧，并单独稳定骨长。raw 仍保存在 `raw_palm_local_joints_m`。当前默认 `beta` 为 `100.0`；
+如需完全关闭平滑，
+可显式添加 `--mobrecon-primary-output raw`。
+
 `--image-root` 默认是 `frames.jsonl` 所在目录，`--calib` 默认是同目录下的
 `cameras.yaml`，所以通常可以简化为：
 

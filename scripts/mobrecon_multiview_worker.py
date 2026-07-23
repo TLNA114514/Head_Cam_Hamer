@@ -37,7 +37,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-id")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--job-batch-size", type=int, default=64)
-    parser.add_argument("--crop-scale", type=float, default=1.5)
+    parser.add_argument(
+        "--crop-scale",
+        type=float,
+        default=1.15,
+        help="Additional crop scale after the job bbox padding; 1.15 combines with the default bbox pad to about 1.32.",
+    )
     parser.add_argument("--input-size", type=int, default=128)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--precision", choices=["float32", "float16"], default="float32")
@@ -333,6 +338,8 @@ def prediction_record(
         "hand_mesh_vertices_cam": mesh_m.tolist() if export_vertices else None,
         "hand_mesh_joints_2d_rectified_px": points_2d.tolist(),
         "hand_mesh_joints_2d_conf": [confidence] * 21,
+        "hand_mesh_joints_2d_conf_source": "sam3_mask_score_proxy",
+        "hand_mesh_joints_2d_conf_is_model_confidence": False,
         "hypothesis_status": (
             "online_dual_hypothesis"
             if job.get("ambiguous_handedness")

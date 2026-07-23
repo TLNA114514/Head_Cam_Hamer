@@ -42,6 +42,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quality-source-bonus", type=float, default=0.06)
     parser.add_argument("--quality-known-bonus", type=float, default=0.05)
     parser.add_argument(
+        "--view-fusion",
+        choices=["mean", "quality-weighted", "robust-medoid"],
+        default="mean",
+        help="Cross-view shape fusion. robust-medoid preserves one coherent predicted hand instead of averaging poses.",
+    )
+    parser.add_argument(
         "--bone-calibration-blend",
         type=float,
         default=0.0,
@@ -62,6 +68,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--one-euro-min-cutoff", type=float, default=0.0, help="One Euro minimum cutoff in Hz; zero disables it.")
     parser.add_argument("--one-euro-beta", type=float, default=0.0, help="One Euro speed coefficient.")
     parser.add_argument("--one-euro-derivative-cutoff", type=float, default=1.0)
+    parser.add_argument(
+        "--one-euro-min-alpha",
+        type=float,
+        default=0.0,
+        help="Minimum new-frame weight. Positive values bound filter lag during slow deliberate motion.",
+    )
+    parser.add_argument(
+        "--one-euro-bone-space",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Filter parent-to-child bone vectors and reconstruct stable bone lengths instead of filtering joints directly.",
+    )
     parser.add_argument("--frame-rate", type=float, default=25.0)
     parser.add_argument(
         "--primary-output",
@@ -142,20 +160,32 @@ def prediction_quality(record: dict[str, Any], args: argparse.Namespace) -> tupl
     }
 
 
-def palm_frame(joints: np.ndarray) -> np.ndarray:
+def palm_frame(joints: np.ndarray) -> np.ndarray | None:
     wrist = joints[0]
     x_axis = joints[5] - wrist
     y_hint = joints[17] - wrist
-    x_axis /= max(float(np.linalg.norm(x_axis)), 1e-8)
+    x_norm = float(np.linalg.norm(x_axis))
+    if x_norm <= 1e-6:
+        return None
+    x_axis /= x_norm
     z_axis = np.cross(x_axis, y_hint)
-    z_axis /= max(float(np.linalg.norm(z_axis)), 1e-8)
+    z_norm = float(np.linalg.norm(z_axis))
+    if z_norm <= 1e-6:
+        return None
+    z_axis /= z_norm
     y_axis = np.cross(z_axis, x_axis)
-    y_axis /= max(float(np.linalg.norm(y_axis)), 1e-8)
+    y_norm = float(np.linalg.norm(y_axis))
+    if y_norm <= 1e-6:
+        return None
+    y_axis /= y_norm
     return np.stack([x_axis, y_axis, z_axis], axis=1)
 
 
 def palm_local(points: np.ndarray, joints: np.ndarray) -> np.ndarray:
-    return (points - joints[0:1]) @ palm_frame(joints)
+    frame = palm_frame(joints)
+    if frame is None:
+        raise ValueError("degenerate palm frame")
+    return (points - joints[0:1]) @ frame
 
 
 def candidate_from_record(record: dict[str, Any], args: argparse.Namespace) -> dict[str, Any] | None:
@@ -163,12 +193,18 @@ def candidate_from_record(record: dict[str, Any], args: argparse.Namespace) -> d
     if not is_xyz_list(joints_value, minimum_length=21):
         return None
     joints_cam = np.asarray(joints_value, dtype=np.float64)
-    local_joints = palm_local(joints_cam[:21], joints_cam[:21])
+    try:
+        local_joints = palm_local(joints_cam[:21], joints_cam[:21])
+    except ValueError:
+        return None
     local_vertices = None
     vertices_value = record.get("hand_mesh_vertices_cam") or record.get("hamer_vertices_cam")
     if args.include_vertices and is_xyz_list(vertices_value):
         vertices_cam = np.asarray(vertices_value, dtype=np.float64)
-        local_vertices = palm_local(vertices_cam, joints_cam[:21])
+        try:
+            local_vertices = palm_local(vertices_cam, joints_cam[:21])
+        except ValueError:
+            return None
     score, score_parts = prediction_quality(record, args)
     return {
         "record": record,
@@ -220,6 +256,34 @@ def bone_lengths(joints: np.ndarray) -> np.ndarray:
     return np.asarray([np.linalg.norm(joints[child] - joints[parent]) for parent, child in HAND_BONES], dtype=np.float64)
 
 
+def joints_to_bone_vectors(joints: np.ndarray) -> np.ndarray:
+    vectors = np.zeros_like(joints, dtype=np.float64)
+    vectors[0] = joints[0]
+    for parent, child in HAND_BONES:
+        vectors[child] = joints[child] - joints[parent]
+    return vectors
+
+
+def bone_vectors_to_joints(
+    vectors: np.ndarray,
+    lengths: np.ndarray,
+    fallback_vectors: np.ndarray,
+) -> np.ndarray:
+    joints = np.zeros_like(vectors, dtype=np.float64)
+    joints[0] = vectors[0]
+    for bone_index, (parent, child) in enumerate(HAND_BONES):
+        direction = vectors[child]
+        norm = float(np.linalg.norm(direction))
+        if norm <= 1e-8:
+            direction = fallback_vectors[child]
+            norm = float(np.linalg.norm(direction))
+        if norm <= 1e-8:
+            joints[child] = joints[parent]
+            continue
+        joints[child] = joints[parent] + direction / norm * float(lengths[bone_index])
+    return joints
+
+
 def estimate_static_bone_lengths(
     selected: dict[tuple[int, str], list[dict[str, Any]]], min_observations: int
 ) -> dict[str, np.ndarray | None]:
@@ -254,15 +318,45 @@ def apply_static_bone_lengths(joints: np.ndarray, target_lengths: np.ndarray | N
     return output
 
 
+def fusion_weights(items: list[dict[str, Any]]) -> np.ndarray:
+    weights = np.asarray([max(float(item.get("quality_score", 0.0)), 0.05) for item in items], dtype=np.float64)
+    return weights / float(np.sum(weights))
+
+
+def robust_medoid_index(items: list[dict[str, Any]], stack: np.ndarray, weights: np.ndarray) -> int:
+    pairwise = np.mean(np.linalg.norm(stack[:, None, :, :] - stack[None, :, :, :], axis=3), axis=2)
+    costs = pairwise @ weights
+    return min(
+        range(len(items)),
+        key=lambda index: (float(costs[index]), -float(weights[index]), str(items[index]["camera_id"])),
+    )
+
+
 def fuse_views(
-    items: list[dict[str, Any]], target_lengths: np.ndarray | None, bone_blend: float, include_vertices: bool
+    items: list[dict[str, Any]],
+    target_lengths: np.ndarray | None,
+    bone_blend: float,
+    include_vertices: bool,
+    method: str = "mean",
 ) -> dict[str, Any]:
+    if method not in {"mean", "quality-weighted", "robust-medoid"}:
+        raise ValueError(f"unknown view fusion method: {method}")
     raw_stack = np.stack([item["joints"] for item in items], axis=0)
     calibrated_stack = np.stack(
         [apply_static_bone_lengths(item["joints"], target_lengths, bone_blend) for item in items], axis=0
     )
-    raw_joints = np.mean(raw_stack, axis=0)
-    calibrated_joints = np.mean(calibrated_stack, axis=0)
+    weights = fusion_weights(items)
+    source_index = None
+    if method == "robust-medoid":
+        source_index = robust_medoid_index(items, raw_stack, weights)
+        raw_joints = raw_stack[source_index].copy()
+        calibrated_joints = calibrated_stack[source_index].copy()
+    elif method == "quality-weighted":
+        raw_joints = np.average(raw_stack, axis=0, weights=weights)
+        calibrated_joints = np.average(calibrated_stack, axis=0, weights=weights)
+    else:
+        raw_joints = np.mean(raw_stack, axis=0)
+        calibrated_joints = np.mean(calibrated_stack, axis=0)
     raw_residuals = np.linalg.norm(raw_stack - raw_joints[None, :, :], axis=2)
     camera_errors = {
         item["camera_id"]: float(np.mean(raw_residuals[index]))
@@ -272,7 +366,13 @@ def fuse_views(
     if include_vertices:
         vertex_items = [item["vertices"] for item in items if item["vertices"] is not None]
         if len(vertex_items) == len(items):
-            vertices = np.mean(np.stack(vertex_items, axis=0), axis=0)
+            vertex_stack = np.stack(vertex_items, axis=0)
+            if source_index is not None:
+                vertices = vertex_stack[source_index].copy()
+            elif method == "quality-weighted":
+                vertices = np.average(vertex_stack, axis=0, weights=weights)
+            else:
+                vertices = np.mean(vertex_stack, axis=0)
     return {
         "raw_joints": raw_joints,
         "static_joints": calibrated_joints,
@@ -281,6 +381,14 @@ def fuse_views(
         "camera_errors_m": camera_errors,
         "mean_consensus_error_m": float(np.mean(raw_residuals)),
         "p95_consensus_error_m": float(np.percentile(raw_residuals, 95)),
+        "fusion_method": method,
+        "fusion_source_camera": items[source_index]["camera_id"] if source_index is not None else None,
+        "fusion_source_track_id": (
+            items[source_index]["record"].get("track_id") if source_index is not None else None
+        ),
+        "fusion_weights": {
+            item["camera_id"]: float(weights[index]) for index, item in enumerate(items)
+        },
     }
 
 
@@ -431,6 +539,8 @@ def one_euro_smooth(
     beta: float,
     derivative_cutoff: float,
     frame_rate: float,
+    min_alpha: float = 0.0,
+    bone_space: bool = False,
 ) -> dict[tuple[int, str], np.ndarray]:
     if min_cutoff <= 0.0:
         return {}
@@ -438,6 +548,7 @@ def one_euro_smooth(
     filtered_state: dict[str, np.ndarray] = {}
     raw_state: dict[str, np.ndarray] = {}
     derivative_state: dict[str, np.ndarray] = {}
+    length_state: dict[str, np.ndarray] = {}
     previous_group: dict[str, int] = {}
     derivative_alpha = float(lowpass_alpha(derivative_cutoff, frame_rate))
     for group_id in sorted({group for group, _hand in sequence}):
@@ -445,11 +556,15 @@ def one_euro_smooth(
             key = (group_id, handedness)
             if key not in sequence:
                 continue
-            current = sequence[key]
+            current_joints = sequence[key]
+            current = joints_to_bone_vectors(current_joints) if bone_space else current_joints
+            current_lengths = bone_lengths(current_joints) if bone_space else None
             contiguous = previous_group.get(handedness) == group_id - 1
             if handedness not in filtered_state or not contiguous:
-                value = current.copy()
+                filtered = current.copy()
                 derivative = np.zeros_like(current)
+                if current_lengths is not None:
+                    length_state[handedness] = current_lengths.copy()
             else:
                 raw_derivative = (current - raw_state[handedness]) * frame_rate
                 derivative = (
@@ -458,10 +573,21 @@ def one_euro_smooth(
                 )
                 joint_speed = np.linalg.norm(derivative, axis=1, keepdims=True)
                 cutoff = min_cutoff + beta * joint_speed
-                alpha = lowpass_alpha(cutoff, frame_rate)
-                value = alpha * current + (1.0 - alpha) * filtered_state[handedness]
+                alpha = np.maximum(lowpass_alpha(cutoff, frame_rate), min_alpha)
+                filtered = alpha * current + (1.0 - alpha) * filtered_state[handedness]
+                if current_lengths is not None:
+                    length_alpha = max(float(lowpass_alpha(min_cutoff, frame_rate)), 0.5 * min_alpha)
+                    length_state[handedness] = (
+                        length_alpha * current_lengths
+                        + (1.0 - length_alpha) * length_state[handedness]
+                    )
+            value = (
+                bone_vectors_to_joints(filtered, length_state[handedness], current)
+                if bone_space
+                else filtered
+            )
             output[key] = value
-            filtered_state[handedness] = value
+            filtered_state[handedness] = filtered
             raw_state[handedness] = current
             derivative_state[handedness] = derivative
             previous_group[handedness] = group_id
@@ -514,6 +640,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--causal-ema-alpha must be in [0, 1]")
     if args.one_euro_min_cutoff < 0.0 or args.one_euro_beta < 0.0:
         raise SystemExit("One Euro cutoff and beta must be non-negative")
+    if not 0.0 <= args.one_euro_min_alpha <= 1.0:
+        raise SystemExit("--one-euro-min-alpha must be in [0, 1]")
     if args.one_euro_derivative_cutoff <= 0.0 or args.frame_rate <= 0.0:
         raise SystemExit("One Euro derivative cutoff and frame rate must be positive")
     if args.primary_output == "static-calibrated" and args.bone_calibration_blend <= 0.0:
@@ -546,7 +674,13 @@ def main() -> None:
     selected = select_per_camera(candidates)
     static_bone_lengths = estimate_static_bone_lengths(selected, args.bone_calibration_min_observations)
     fused_by_key = {
-        key: fuse_views(items, static_bone_lengths.get(key[1]), args.bone_calibration_blend, args.include_vertices)
+        key: fuse_views(
+            items,
+            static_bone_lengths.get(key[1]),
+            args.bone_calibration_blend,
+            args.include_vertices,
+            args.view_fusion,
+        )
         for key, items in selected.items()
     }
     interpolated_by_key, interpolation_stats = interpolate_short_gaps(
@@ -567,6 +701,8 @@ def main() -> None:
         args.one_euro_beta,
         args.one_euro_derivative_cutoff,
         args.frame_rate,
+        args.one_euro_min_alpha,
+        args.one_euro_bone_space,
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -635,6 +771,8 @@ def main() -> None:
                         "causal_ema_alpha": args.causal_ema_alpha if args.causal_ema_alpha > 0 else None,
                         "one_euro_min_cutoff": args.one_euro_min_cutoff if args.one_euro_min_cutoff > 0 else None,
                         "one_euro_beta": args.one_euro_beta if args.one_euro_min_cutoff > 0 else None,
+                        "one_euro_min_alpha": args.one_euro_min_alpha if args.one_euro_min_cutoff > 0 else None,
+                        "one_euro_bone_space": args.one_euro_bone_space if args.one_euro_min_cutoff > 0 else None,
                         "one_euro_derivative_cutoff": (
                             args.one_euro_derivative_cutoff if args.one_euro_min_cutoff > 0 else None
                         ),
@@ -655,7 +793,7 @@ def main() -> None:
                 hand = {
                     "group_id": group_id,
                     "handedness": handedness,
-                    "mode": f"zero_shot_multiview_mean:{primary_source}",
+                    "mode": f"zero_shot_multiview_{fused['fusion_method']}:{primary_source}",
                     "metric_valid": len(items) >= 2,
                     "local_shape_valid": True,
                     "temporal_interpolated": False,
@@ -677,12 +815,18 @@ def main() -> None:
                     "per_camera_consensus_error_m": fused["camera_errors_m"],
                     "per_camera_quality_scores": {item["camera_id"]: item["quality_score"] for item in items},
                     "per_camera_quality_parts": {item["camera_id"]: item["quality_parts"] for item in items},
+                    "view_fusion_method": fused["fusion_method"],
+                    "view_fusion_source_camera": fused["fusion_source_camera"],
+                    "view_fusion_source_track_id": fused["fusion_source_track_id"],
+                    "view_fusion_weights": fused["fusion_weights"],
                     "bone_calibration_blend": args.bone_calibration_blend,
                     "temporal_radius": args.temporal_radius,
                     "temporal_sigma": args.temporal_sigma if args.temporal_radius > 0 else None,
                     "causal_ema_alpha": args.causal_ema_alpha if args.causal_ema_alpha > 0 else None,
                     "one_euro_min_cutoff": args.one_euro_min_cutoff if args.one_euro_min_cutoff > 0 else None,
                     "one_euro_beta": args.one_euro_beta if args.one_euro_min_cutoff > 0 else None,
+                    "one_euro_min_alpha": args.one_euro_min_alpha if args.one_euro_min_cutoff > 0 else None,
+                    "one_euro_bone_space": args.one_euro_bone_space if args.one_euro_min_cutoff > 0 else None,
                     "one_euro_derivative_cutoff": (
                         args.one_euro_derivative_cutoff if args.one_euro_min_cutoff > 0 else None
                     ),
@@ -714,6 +858,7 @@ def main() -> None:
         "group_range": args.group_range,
         "group_ids": args.group_ids,
         "primary_output": args.primary_output,
+        "view_fusion": args.view_fusion,
         "bone_calibration_blend": args.bone_calibration_blend,
         "bone_calibration_min_observations": args.bone_calibration_min_observations,
         "static_bone_lengths_m": {
@@ -729,11 +874,17 @@ def main() -> None:
         "causal_ema_alpha": args.causal_ema_alpha,
         "one_euro_min_cutoff": args.one_euro_min_cutoff,
         "one_euro_beta": args.one_euro_beta,
+        "one_euro_min_alpha": args.one_euro_min_alpha,
+        "one_euro_bone_space": args.one_euro_bone_space,
         "one_euro_derivative_cutoff": args.one_euro_derivative_cutoff,
         "frame_rate": args.frame_rate,
         "include_vertices": args.include_vertices,
-        "cross_view_weighting": "equal",
-        "quality_score_usage": "within-camera duplicate selection only",
+        "cross_view_weighting": args.view_fusion,
+        "quality_score_usage": (
+            "within-camera duplicate selection and cross-view fusion"
+            if args.view_fusion != "mean"
+            else "within-camera duplicate selection only"
+        ),
         "uses_ground_truth": False,
         "stats": dict(stats),
     }

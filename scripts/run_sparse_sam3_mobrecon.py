@@ -88,8 +88,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mobrecon-precision", choices=["float32", "float16"], default="float32")
     parser.add_argument("--mobrecon-batch-size", type=int, default=8)
     parser.add_argument("--mobrecon-torch-threads", type=int, default=8)
+    parser.add_argument("--mobrecon-crop-scale", type=float, default=1.15)
+    parser.add_argument("--tracker-bbox-pad", type=float, default=1.15)
+    parser.add_argument(
+        "--mobrecon-view-fusion",
+        choices=["mean", "quality-weighted", "robust-medoid"],
+        default="robust-medoid",
+    )
+    parser.add_argument(
+        "--mobrecon-primary-output",
+        choices=["raw", "adaptive-causal"],
+        default="adaptive-causal",
+        help="Use motion-preserving filtered joints as the main result; raw remains available as a secondary field.",
+    )
     parser.add_argument("--one-euro-min-cutoff", type=float, default=0.25)
-    parser.add_argument("--one-euro-beta", type=float, default=0.05)
+    parser.add_argument(
+        "--one-euro-beta",
+        type=float,
+        default=100.0,
+        help="Speed coefficient in Hz per (m/s); 100 favors low-latency response during deliberate motion.",
+    )
+    parser.add_argument("--one-euro-derivative-cutoff", type=float, default=1.0)
+    parser.add_argument("--one-euro-min-alpha", type=float, default=0.4)
+    parser.add_argument(
+        "--one-euro-bone-space",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--frame-rate", type=float, default=25.0)
     parser.add_argument("--handedness-switch-confirm-keyframes", type=int, default=2)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--overwrite", action="store_true")
@@ -231,13 +257,20 @@ def main() -> None:
         or args.vram_budget_gib <= 0.0
         or args.sam3_torch_threads < 1
         or args.mobrecon_torch_threads < 1
+        or args.mobrecon_crop_scale <= 0.0
+        or args.tracker_bbox_pad <= 0.0
         or args.one_euro_min_cutoff < 0.0
         or args.one_euro_beta < 0.0
+        or args.one_euro_derivative_cutoff <= 0.0
+        or not 0.0 <= args.one_euro_min_alpha <= 1.0
+        or args.frame_rate <= 0.0
         or args.handedness_switch_confirm_keyframes < 1
     ):
         raise SystemExit("stride, VRAM, and threads must be positive; One-Euro values must be non-negative")
     if not 0.0 <= args.sam3_duplicate_mask_containment <= 1.0:
         raise SystemExit("--sam3-duplicate-mask-containment must be in [0, 1]")
+    if args.mobrecon_primary_output == "adaptive-causal" and args.one_euro_min_cutoff <= 0.0:
+        raise SystemExit("--mobrecon-primary-output adaptive-causal requires --one-euro-min-cutoff > 0")
     if args.rectify_focal_scale is not None and args.rectify_focal_scale <= 0.0:
         raise SystemExit("--rectify-focal-scale must be positive")
     args.image_root = args.image_root or args.frames.parent
@@ -384,6 +417,10 @@ def main() -> None:
             str(args.keyframe_stride),
             "--flow-scale",
             str(args.flow_scale),
+            "--bbox-pad",
+            str(args.tracker_bbox_pad),
+            "--crop-scale",
+            str(args.mobrecon_crop_scale),
             "--batch-size",
             str(args.mobrecon_batch_size),
             "--torch-threads",
@@ -392,6 +429,16 @@ def main() -> None:
             str(args.one_euro_min_cutoff),
             "--one-euro-beta",
             str(args.one_euro_beta),
+            "--one-euro-derivative-cutoff",
+            str(args.one_euro_derivative_cutoff),
+            "--one-euro-min-alpha",
+            str(args.one_euro_min_alpha),
+            "--frame-rate",
+            str(args.frame_rate),
+            "--view-fusion",
+            args.mobrecon_view_fusion,
+            "--primary-output",
+            args.mobrecon_primary_output,
             "--handedness-switch-confirm-keyframes",
             str(args.handedness_switch_confirm_keyframes),
             "--microbatch-groups",
@@ -403,6 +450,7 @@ def main() -> None:
             *selected_range_args,
             *overwrite,
         ]
+        cpu_command.append("--one-euro-bone-space" if args.one_euro_bone_space else "--no-one-euro-bone-space")
         if args.mobrecon_checkpoint:
             cpu_command.extend(["--checkpoint", str(args.mobrecon_checkpoint)])
         if keyframe_reused:
@@ -450,10 +498,19 @@ def main() -> None:
             "sam3_duplicate_mask_containment": args.sam3_duplicate_mask_containment,
             "sam3_torch_threads": args.sam3_torch_threads,
             "mobrecon_torch_threads": args.mobrecon_torch_threads,
+            "mobrecon_crop_scale": args.mobrecon_crop_scale,
+            "tracker_bbox_pad": args.tracker_bbox_pad,
+            "effective_mobrecon_crop_scale": args.mobrecon_crop_scale * args.tracker_bbox_pad,
+            "mobrecon_view_fusion": args.mobrecon_view_fusion,
+            "mobrecon_primary_output": args.mobrecon_primary_output,
             "mobrecon_root": str(args.mobrecon_root),
             "mobrecon_checkpoint": str(args.mobrecon_checkpoint) if args.mobrecon_checkpoint else None,
             "one_euro_min_cutoff": args.one_euro_min_cutoff,
             "one_euro_beta": args.one_euro_beta,
+            "one_euro_derivative_cutoff": args.one_euro_derivative_cutoff,
+            "one_euro_min_alpha": args.one_euro_min_alpha,
+            "one_euro_bone_space": args.one_euro_bone_space,
+            "frame_rate": args.frame_rate,
             "handedness_switch_confirm_keyframes": args.handedness_switch_confirm_keyframes,
             "mobrecon_precision": args.mobrecon_precision,
             "execution_mode": "streaming",
@@ -536,6 +593,8 @@ def main() -> None:
         "--mask-frame-mode",
         "none",
         "--no-save-debug",
+        "--bbox-pad",
+        str(args.tracker_bbox_pad),
         "--camera-handedness-prior",
         "none",
         *selected_range_args,
@@ -558,6 +617,8 @@ def main() -> None:
         str(args.mobrecon_batch_size),
         "--torch-threads",
         str(args.mobrecon_torch_threads),
+        "--crop-scale",
+        str(args.mobrecon_crop_scale),
         "--image-source",
         "rectified",
         "--device",
@@ -580,9 +641,14 @@ def main() -> None:
         str(predictions_path),
         "--output-dir",
         str(fused_dir),
+        "--view-fusion",
+        args.mobrecon_view_fusion,
+        "--primary-output",
+        args.mobrecon_primary_output,
         *selected_range_args,
         *overwrite,
     ]
+    fusion_command.append("--one-euro-bone-space" if args.one_euro_bone_space else "--no-one-euro-bone-space")
     if args.one_euro_min_cutoff > 0.0:
         fusion_command.extend(
             [
@@ -590,8 +656,12 @@ def main() -> None:
                 str(args.one_euro_min_cutoff),
                 "--one-euro-beta",
                 str(args.one_euro_beta),
-                "--primary-output",
-                "adaptive-causal",
+                "--one-euro-derivative-cutoff",
+                str(args.one_euro_derivative_cutoff),
+                "--one-euro-min-alpha",
+                str(args.one_euro_min_alpha),
+                "--frame-rate",
+                str(args.frame_rate),
             ]
         )
     stage_seconds["fusion"] = run_command("fusion", fusion_command, args.dry_run)
@@ -614,10 +684,19 @@ def main() -> None:
         "sam3_duplicate_mask_containment": args.sam3_duplicate_mask_containment,
         "sam3_torch_threads": args.sam3_torch_threads,
         "mobrecon_torch_threads": args.mobrecon_torch_threads,
+        "mobrecon_crop_scale": args.mobrecon_crop_scale,
+        "tracker_bbox_pad": args.tracker_bbox_pad,
+        "effective_mobrecon_crop_scale": args.mobrecon_crop_scale * args.tracker_bbox_pad,
+        "mobrecon_view_fusion": args.mobrecon_view_fusion,
+        "mobrecon_primary_output": args.mobrecon_primary_output,
         "mobrecon_root": str(args.mobrecon_root),
         "mobrecon_checkpoint": str(args.mobrecon_checkpoint) if args.mobrecon_checkpoint else None,
         "one_euro_min_cutoff": args.one_euro_min_cutoff,
         "one_euro_beta": args.one_euro_beta,
+        "one_euro_derivative_cutoff": args.one_euro_derivative_cutoff,
+        "one_euro_min_alpha": args.one_euro_min_alpha,
+        "one_euro_bone_space": args.one_euro_bone_space,
+        "frame_rate": args.frame_rate,
         "handedness_switch_confirm_keyframes": args.handedness_switch_confirm_keyframes,
         "mobrecon_precision": args.mobrecon_precision,
         "execution_mode": "sequential",
