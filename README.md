@@ -206,9 +206,19 @@ The MobRecon low-latency path prepares or reuses the
   --sam3-workers 2 \
   --sam3-prompt-preset bare \
   --sam3-duplicate-mask-containment 0.9 \
+  --execution-mode streaming \
   --mobrecon-device cpu \
   --mobrecon-precision float32 \
-  --mobrecon-torch-threads 8
+  --mobrecon-torch-threads 8 \
+  --mobrecon-crop-scale 1.15 \
+  --tracker-bbox-pad 1.15 \
+  --mobrecon-view-fusion robust-medoid \
+  --mobrecon-primary-output adaptive-causal \
+  --one-euro-min-cutoff 0.25 \
+  --one-euro-beta 100 \
+  --one-euro-min-alpha 0.4 \
+  --one-euro-bone-space \
+  --frame-rate 25
 ```
 
 MobRecon now defaults to all four cameras (`C0,C1,C2,C3`) as the
@@ -237,6 +247,20 @@ new-frame weight of `0.4` for a causal one-to-two-frame response without future
 frame buffering, and stabilizes bone lengths separately. Raw joints remain in `raw_palm_local_joints_m`; add
 `--mobrecon-primary-output raw` to disable smoothing as the primary output. The
 meter-scale default `beta` is `100.0`.
+
+The main command spells out the smoothing parameters for reproducible runs.
+Common tuning directions are:
+
+| Goal | `min-cutoff` | `beta` | `min-alpha` | Expected behavior |
+|---|---:|---:|---:|---|
+| Recommended | `0.25` | `100` | `0.4` | Balance low latency and stability |
+| Smoother | `0.20` | `80` | `0.3` | More stable at rest, slightly slower response |
+| Lower latency | `0.25` | `150` | `0.5` | Faster motion response, potentially more jitter |
+
+Keep `--one-euro-bone-space` enabled unless evaluating an ablation; it filters
+parent-to-child bone vectors and stabilizes bone lengths separately. Set
+`--frame-rate` to the actual input rate. All of these filters are causal and do
+not read future frames.
 
 `--image-root` defaults to the directory containing `frames.jsonl`, and
 `--calib` defaults to `cameras.yaml` in that directory. Therefore the compact
@@ -271,6 +295,10 @@ explicitly:
 ```
 
 The corresponding MobRecon low-latency run is:
+
+This dataset command uses the recommended causal smoothing defaults above. For
+a fully pinned experiment, append the smoothing block from the main MobRecon
+example.
 
 ```bash
 ./scripts/run.sh \
