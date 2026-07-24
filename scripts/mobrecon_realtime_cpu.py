@@ -28,6 +28,7 @@ from fuse_hamer_palm_local import (
 )
 from hamer_multiview_utils import (
     DEFAULT_BASE_DIR,
+    DEFAULT_CAMERAS,
     DEFAULT_FRAMES,
     expand_bbox,
     filter_frame_records,
@@ -62,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_BASE_DIR / "mobrecon_realtime_cpu")
     parser.add_argument("--mobrecon-root", type=Path, default=DEFAULT_MOBRECON_ROOT)
     parser.add_argument("--checkpoint", type=Path)
-    parser.add_argument("--cameras", default="C0,C2,C3")
+    parser.add_argument("--cameras", default=",".join(DEFAULT_CAMERAS))
     parser.add_argument("--group-range")
     parser.add_argument("--group-ids")
     parser.add_argument("--keyframe-stride", type=int, default=10)

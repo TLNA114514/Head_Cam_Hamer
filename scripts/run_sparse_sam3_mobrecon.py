@@ -13,7 +13,13 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from hamer_multiview_utils import DEFAULT_RECTIFY_FOCAL_SCALE, parse_cameras, parse_group_ids, range_suffix
+from hamer_multiview_utils import (
+    DEFAULT_CAMERAS,
+    DEFAULT_RECTIFY_FOCAL_SCALE,
+    parse_cameras,
+    parse_group_ids,
+    range_suffix,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -46,7 +52,7 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Prepare/reuse base-dir/rectified_for_hamer before inference.",
     )
-    parser.add_argument("--cameras", default="C0,C2,C3")
+    parser.add_argument("--cameras", default=",".join(DEFAULT_CAMERAS))
     parser.add_argument("--group-range")
     parser.add_argument("--group-ids")
     parser.add_argument("--keyframe-stride", type=int, default=10)

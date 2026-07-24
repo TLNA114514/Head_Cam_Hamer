@@ -200,7 +200,7 @@ The MobRecon low-latency path prepares or reuses the
   --calib /path/to/dataset/cameras.yaml \
   --base-dir outputs/my_realtime_run \
   --rectify-focal-scale 0.7 \
-  --cameras C0,C2,C3 \
+  --cameras C0,C1,C2,C3 \
   --group-range 0-999 \
   --keyframe-stride 10 \
   --sam3-workers 2 \
@@ -211,12 +211,15 @@ The MobRecon low-latency path prepares or reuses the
   --mobrecon-torch-threads 8
 ```
 
-These MobRecon defaults match the validated two-SAM3-GPU-producer plus CPU
-MobRecon schedule. `C0,C2,C3` is a throughput configuration for the current
-rig, not a universal camera subset; validate camera combinations again for a
-different rig or a quality-first run. GPU FP32 MobRecon is worth testing with
-one resident SAM3 worker, but measured GPU contention reduced total throughput
-when two SAM3 workers ran concurrently.
+MobRecon now defaults to all four cameras (`C0,C1,C2,C3`) as the
+accuracy-first configuration. Extra views improve coverage under occlusion and
+give `robust-medoid` more coherent pose candidates. This setup matches the
+validated two-SAM3-GPU-producer plus CPU MobRecon schedule. The historical
+`C0,C2,C3` subset is now only a throughput option; select it explicitly after
+confirming that C1 is low quality or that four-camera throughput is
+insufficient. GPU FP32 MobRecon is worth testing with one resident SAM3 worker,
+but measured GPU contention reduced total throughput when two SAM3 workers ran
+concurrently.
 
 MobRecon now defaults to accuracy-first handedness. The `bare` prompt set adds
 semantic left/right evidence. Duplicate suppression removes only candidates
@@ -525,6 +528,12 @@ external/wrist_cam/third_party/hamer
 external/wrist_cam/third_party/sam3
 external/HandMesh
 ```
+
+MobRecon prefers a HandMesh directory containing both the source and
+`pretrained/mobrecon_densestack.pt`. For compatibility with older installs, it
+automatically uses `third_party/HandMesh` when `external/HandMesh` lacks the
+checkpoint and the legacy directory is complete. Production setups should
+still use `external/HandMesh` or set `MOBRECON_ROOT` to one explicit directory.
 
 They can be overridden without changing code:
 
